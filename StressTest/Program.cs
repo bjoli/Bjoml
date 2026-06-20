@@ -16,6 +16,8 @@ class Program
         await RunRingBenchmark();
         Console.WriteLine();
         await RunProducerConsumerBenchmark();
+        Console.WriteLine();
+        await RunCombinatorTest();
 
         Console.WriteLine("\nAll tests completed.");
     }
@@ -140,5 +142,46 @@ class Program
 
         sw.Stop();
         Console.WriteLine($"Producer/Consumer finished in {sw.ElapsedMilliseconds} ms. Total Messages Processed: {totalReceived}");
+    }
+
+    static async Task RunCombinatorTest()
+    {
+        Console.WriteLine("--- CML Combinators Test (Choose, Wrap, WithNack) ---");
+        var chan1 = new Channel<string>();
+        var chan2 = new Channel<string>();
+
+        // We will do a choose between receiving from chan1 or chan2.
+        // We will wrap both to uppercase.
+        // We will add a NACK to chan1 so if we receive from chan2 instead, chan1's NACK will fire.
+
+        bool nackFired = false;
+
+        var ev1 = Cml.WithNack(nackChan => 
+        {
+            // Background task to listen for the NACK
+            Task.Run(async () => 
+            {
+                await Cml.SyncAsync(nackChan);
+                nackFired = true;
+            });
+
+            return Cml.Wrap(new ChannelReceiveEvent<string>(chan1), s => s.ToUpper() + " (from chan1)");
+        });
+
+        var ev2 = Cml.Wrap(new ChannelReceiveEvent<string>(chan2), s => s.ToUpper() + " (from chan2)");
+
+        var choice = Cml.Choose(ev1, ev2);
+
+        // Send to chan2 to ensure ev2 wins
+        var sendTask = chan2.PutMessage("hello");
+        
+        var result = await Cml.SyncAsync(choice);
+        await sendTask;
+
+        Console.WriteLine($"Result: {result}");
+        
+        // Wait briefly to allow NACK to fire on the ThreadPool
+        await Task.Delay(100);
+        Console.WriteLine($"Nack fired for chan1? {nackFired}");
     }
 }

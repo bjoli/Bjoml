@@ -12,10 +12,11 @@ public class Channel<T>
     internal readonly ObjectPool<PutOp<T>> _putPool = ObjectPool.Create<PutOp<T>>();
     internal readonly ObjectPool<GetOp<T>> _getPool = ObjectPool.Create<GetOp<T>>();
 
-    public void PublishSend(SyncState state, T value, Action resumePut)
+    public void PublishSend(SyncState state, int eventId, T value, Action resumePut)
     {
         var myOp = _putPool.Get();
         myOp.State = state;
+        myOp.EventId = eventId;
         myOp.Value = value;
         myOp.ResumePut = resumePut;
 
@@ -34,7 +35,8 @@ public class Channel<T>
                 if (getOp.TrySync())
                 {
                     var getResume = getOp.ResumeGet;
-                    state.MarkSynchronized();
+                    state.MarkSynchronized(eventId);
+                    getOp.State.MarkSynchronized(getOp.EventId);
 
                     var myResume = resumePut;
                     T capturedValue = value;
@@ -70,10 +72,11 @@ public class Channel<T>
         }
     }
 
-    public void PublishReceive(SyncState state, Action<T> resumeGet)
+    public void PublishReceive(SyncState state, int eventId, Action<T> resumeGet)
     {
         var myOp = _getPool.Get();
         myOp.State = state;
+        myOp.EventId = eventId;
         myOp.ResumeGet = resumeGet;
 
         _getq.Enqueue(myOp);
@@ -93,7 +96,8 @@ public class Channel<T>
                     T capturedValue = putOp.Value;
                     var putResume = putOp.ResumePut;
 
-                    state.MarkSynchronized();
+                    state.MarkSynchronized(eventId);
+                    putOp.State.MarkSynchronized(putOp.EventId);
 
                     var myResume = resumeGet;
 

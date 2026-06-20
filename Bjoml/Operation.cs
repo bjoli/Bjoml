@@ -5,11 +5,12 @@ namespace Bjoml;
 public abstract class Operation
 {
     public SyncState State; 
+    public int EventId;
 
     public bool IsSynchronized => State.IsSynchronized;
     public bool TryClaim() => State.TryClaim();
     public bool TrySync() => State.TrySync();
-    public void MarkSynchronized() => State.MarkSynchronized();
+    public void MarkSynchronized() => State.MarkSynchronized(EventId);
     public void ResetClaim() => State.ResetClaim();
 }
 
@@ -23,6 +24,7 @@ public class PutOp<T> : Operation, IResettable
         Value = default!;
         ResumePut = null!;
         State = null!; 
+        EventId = 0;
         return true;
     }
 }
@@ -35,6 +37,7 @@ public class GetOp<T> : Operation, IResettable
     {
         ResumeGet = null!;
         State = null!; 
+        EventId = 0;
         return true;
     }
 }
