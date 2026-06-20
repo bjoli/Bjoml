@@ -43,6 +43,11 @@ public static class Cml
 
 // ---------------- Implementation of Combinators ----------------
 
+/// <summary>
+/// Combines multiple events into a single choice. 
+/// In CML, 'choose' allows a thread to wait on multiple possible synchronizations simultaneously.
+/// The first event to successfully claim the shared state wins, and all others are discarded.
+/// </summary>
 public class ChooseEvent<T> : IEvent<T>
 {
     private readonly IEvent<T>[] _events;
@@ -50,7 +55,10 @@ public class ChooseEvent<T> : IEvent<T>
 
     public void Publish(SyncState sharedState, int eventId, Action<T> onSync)
     {
-        // For choose, we generate a new ID for each branch, so we know which one won
+        // For choose, we generate a NEW Event ID for each branch.
+        // This is strictly necessary because if branch A wins, we MUST fire the NACKs for branch B and C.
+        // By giving them different EventIDs under the same SyncState, the SyncState knows exactly which 
+        // branch won and can fire the NACKs belonging to the losers.
         foreach (var ev in _events)
         {
             ev.Publish(sharedState, sharedState.GenerateEventId(), onSync);
@@ -58,6 +66,12 @@ public class ChooseEvent<T> : IEvent<T>
     }
 }
 
+/// <summary>
+/// Wraps an event to map its result.
+/// Because ChooseEvent requires all its branches to return the same type T, Wrap is essential.
+/// It allows you to combine differently-typed events (like receiving an Int vs a String) 
+/// into a unified type before passing them to Choose.
+/// </summary>
 public class WrapEvent<T, U> : IEvent<U>
 {
     private readonly IEvent<T> _ev;
@@ -71,10 +85,16 @@ public class WrapEvent<T, U> : IEvent<U>
 
     public void Publish(SyncState sharedState, int eventId, Action<U> onSync)
     {
+        // Intercept the synchronization callback to apply the mapping function before resuming the user.
         _ev.Publish(sharedState, eventId, value => onSync(_mapper(value)));
     }
 }
 
+/// <summary>
+/// Delays the creation of an event until it is actually synchronized.
+/// This is used when the event requires side-effects or dynamic state to be allocated 
+/// only at the exact moment the thread commits to the synchronization block.
+/// </summary>
 public class GuardEvent<T> : IEvent<T>
 {
     private readonly Func<IEvent<T>> _generator;
@@ -88,6 +108,12 @@ public class GuardEvent<T> : IEvent<T>
     }
 }
 
+/// <summary>
+/// Negative Acknowledgement (NACK). 
+/// When composing complex choices, a thread often needs to know if a specific branch LOST the race 
+/// so it can abort tentative operations or clean up resources.
+/// WithNack passes a NACK event (which fires if the branch loses) into a generator that builds the actual event.
+/// </summary>
 public class WithNackEvent<T> : IEvent<T>
 {
     private readonly Func<IEvent<Unit>, IEvent<T>> _generator;
@@ -100,14 +126,18 @@ public class WithNackEvent<T> : IEvent<T>
     public void Publish(SyncState sharedState, int eventId, Action<T> onSync)
     {
         var nackChan = new Channel<Unit>();
-        // Register the nack so that if this specific eventId DOES NOT WIN, we fire the nack channel
+        
+        // We register the NACK callback on the shared state, bound specifically to OUR 'eventId'.
+        // If the sharedState is synchronized by any other EventID, it will trigger this callback.
+        // We use a completely independent SyncState (new SyncState()) for the nackChan's PublishSend 
+        // because the NACK delivery is a distinct rendezvous.
         sharedState.RegisterNack(eventId, () => nackChan.PublishSend(new SyncState(), 1, new Unit(), () => { }));
 
         var ev = _generator(new ChannelReceiveEvent<Unit>(nackChan));
         
         // Publish the generated event WITH OUR EVENT ID. 
-        // This means if `ev` wins, it uses our eventId as the winner, 
-        // so our nack is NOT fired!
+        // This means if `ev` wins, it identifies itself to the SyncState using our eventId, 
+        // which tells the SyncState NOT to fire our registered NACK!
         ev.Publish(sharedState, eventId, onSync);
     }
 }
@@ -119,6 +149,7 @@ public class AlwaysEvent<T> : IEvent<T>
 
     public void Publish(SyncState sharedState, int eventId, Action<T> onSync)
     {
+        // It immediately attempts to claim the state. If it succeeds, it bypasses queues entirely.
         if (sharedState.TryClaim())
         {
             sharedState.MarkSynchronized(eventId);
@@ -131,7 +162,7 @@ public class NeverEvent<T> : IEvent<T>
 {
     public void Publish(SyncState sharedState, int eventId, Action<T> onSync)
     {
-        // Do nothing. It never synchronizes.
+        // Do nothing. It never synchronizes, mimicking an event that never occurs.
     }
 }
 
