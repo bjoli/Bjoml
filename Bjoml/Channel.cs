@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using Microsoft.Extensions.ObjectPool;
 
 namespace Bjoml;
 
@@ -8,41 +9,57 @@ public class Channel<T>
     internal readonly ConcurrentQueue<PutOp<T>> _putq = new();
     internal readonly ConcurrentQueue<GetOp<T>> _getq = new();
 
+    internal readonly ObjectPool<PutOp<T>> _putPool = ObjectPool.Create<PutOp<T>>();
+    internal readonly ObjectPool<GetOp<T>> _getPool = ObjectPool.Create<GetOp<T>>();
+
     public void PublishSend(SyncState state, T value, Action resumePut)
     {
-        var myOp = new PutOp<T> { State = state, Value = value, ResumePut = resumePut };
+        var myOp = _putPool.Get();
+        myOp.State = state;
+        myOp.Value = value;
+        myOp.ResumePut = resumePut;
 
         _putq.Enqueue(myOp);
 
-        while (_getq.TryDequeue(out var getOp))
+        while (true)
         {
-            if (getOp.IsSynchronized) 
+            if (!state.TryClaim()) 
             {
-                continue;
+                return;
             }
 
-            if (myOp.TryClaim())
+            if (_getq.TryDequeue(out var getOp))
             {
+                if (getOp.IsSynchronized) 
+                {
+                    _getPool.Return(getOp);
+                    state.ResetClaim();
+                    continue;
+                }
+
                 if (getOp.TrySync())
                 {
-                    myOp.MarkSynchronized();
-
-                    T capturedValue = value;
-                    var myResume = myOp.ResumePut;
                     var getResume = getOp.ResumeGet;
+                    state.MarkSynchronized();
+
+                    var myResume = resumePut;
+                    T capturedValue = value;
 
                     Scheduler.Enqueue(() => myResume());
                     Scheduler.Enqueue(() => getResume(capturedValue));
                     
+                    _getPool.Return(getOp);
                     return;
                 }
                 else
                 {
-                    myOp.ResetClaim();
+                    _getPool.Return(getOp);
+                    state.ResetClaim();
                 }
             }
             else
             {
+                state.ResetClaim();
                 return;
             }
         }
@@ -50,39 +67,52 @@ public class Channel<T>
 
     public void PublishReceive(SyncState state, Action<T> resumeGet)
     {
-        var myOp = new GetOp<T> { State = state, ResumeGet = resumeGet };
+        var myOp = _getPool.Get();
+        myOp.State = state;
+        myOp.ResumeGet = resumeGet;
 
         _getq.Enqueue(myOp);
 
-        while (_putq.TryDequeue(out var putOp))
+        while (true)
         {
-            if (putOp.IsSynchronized) 
+            if (!state.TryClaim()) 
             {
-                continue;
+                return;
             }
 
-            if (myOp.TryClaim())
+            if (_putq.TryDequeue(out var putOp))
             {
+                if (putOp.IsSynchronized) 
+                {
+                    _putPool.Return(putOp);
+                    state.ResetClaim();
+                    continue;
+                }
+
                 if (putOp.TrySync())
                 {
-                    myOp.MarkSynchronized();
-
                     T capturedValue = putOp.Value;
-                    var myResume = myOp.ResumeGet;
                     var putResume = putOp.ResumePut;
+
+                    state.MarkSynchronized();
+
+                    var myResume = resumeGet;
 
                     Scheduler.Enqueue(() => putResume());
                     Scheduler.Enqueue(() => myResume(capturedValue));
 
+                    _putPool.Return(putOp);
                     return;
                 }
                 else
                 {
-                    myOp.ResetClaim();
+                    _putPool.Return(putOp);
+                    state.ResetClaim();
                 }
             }
             else
             {
+                state.ResetClaim();
                 return;
             }
         }
