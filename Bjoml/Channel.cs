@@ -21,22 +21,16 @@ public class Channel<T>
 
         _putq.Enqueue(myOp);
 
-        while (true)
+        while (_getq.TryDequeue(out var getOp))
         {
-            if (!state.TryClaim()) 
+            if (getOp.IsSynchronized) 
             {
-                return;
+                _getPool.Return(getOp);
+                continue;
             }
 
-            if (_getq.TryDequeue(out var getOp))
+            if (state.TryClaim())
             {
-                if (getOp.IsSynchronized) 
-                {
-                    _getPool.Return(getOp);
-                    state.ResetClaim();
-                    continue;
-                }
-
                 if (getOp.TrySync())
                 {
                     var getResume = getOp.ResumeGet;
@@ -53,13 +47,24 @@ public class Channel<T>
                 }
                 else
                 {
-                    _getPool.Return(getOp);
                     state.ResetClaim();
+                    if (getOp.IsSynchronized)
+                        _getPool.Return(getOp);
+                    else
+                    {
+                        _getq.Enqueue(getOp); // Put it back to prevent losing it
+                        System.Threading.Thread.Yield();
+                    }
                 }
             }
             else
             {
-                state.ResetClaim();
+                // We failed to claim our state. It was claimed/synced by someone else.
+                // We MUST put getOp back!
+                if (getOp.IsSynchronized)
+                    _getPool.Return(getOp);
+                else
+                    _getq.Enqueue(getOp);
                 return;
             }
         }
@@ -73,22 +78,16 @@ public class Channel<T>
 
         _getq.Enqueue(myOp);
 
-        while (true)
+        while (_putq.TryDequeue(out var putOp))
         {
-            if (!state.TryClaim()) 
+            if (putOp.IsSynchronized) 
             {
-                return;
+                _putPool.Return(putOp);
+                continue;
             }
 
-            if (_putq.TryDequeue(out var putOp))
+            if (state.TryClaim())
             {
-                if (putOp.IsSynchronized) 
-                {
-                    _putPool.Return(putOp);
-                    state.ResetClaim();
-                    continue;
-                }
-
                 if (putOp.TrySync())
                 {
                     T capturedValue = putOp.Value;
@@ -106,13 +105,22 @@ public class Channel<T>
                 }
                 else
                 {
-                    _putPool.Return(putOp);
                     state.ResetClaim();
+                    if (putOp.IsSynchronized)
+                        _putPool.Return(putOp);
+                    else
+                    {
+                        _putq.Enqueue(putOp);
+                        System.Threading.Thread.Yield();
+                    }
                 }
             }
             else
             {
-                state.ResetClaim();
+                if (putOp.IsSynchronized)
+                    _putPool.Return(putOp);
+                else
+                    _putq.Enqueue(putOp);
                 return;
             }
         }
