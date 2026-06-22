@@ -21,13 +21,11 @@ namespace Bjoml;
 
 public abstract class Operation
 {
-    // Every queued operation holds a reference to the SyncState of the 'Cml.Sync' block that created it.
-    // By locking and mutating this shared state, we pair operations atomically.
     public SyncState State; 
-    
-    // The specific EventId for this branch in a 'Choose' block. 
-    // This allows the SyncState to know which branch won, so it can fire the NACKs for the losers.
     public int EventId;
+
+    // Must be a field (not a property) for Interlocked.CompareExchange to take a ref
+    internal Operation? Next;
 
     public bool IsSynchronized => State.IsSynchronized;
     public bool TryClaim() => State.TryClaim();

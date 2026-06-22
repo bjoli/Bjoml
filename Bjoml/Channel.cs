@@ -23,16 +23,30 @@ namespace Bjoml;
 
 public class Channel<T>
 {
-    // We use ConcurrentQueues to hold unmatched operations. A channel is fundamentally a rendezvous point.
+    
+    
+    // A channel is fundamentally a rendezvous point.
     // If a Send arrives before a Receive, it is queued in _putq. If a Receive arrives first, it is queued in _getq.
-    internal readonly ConcurrentQueue<PutOp<T>> _putq = new();
-    internal readonly ConcurrentQueue<GetOp<T>> _getq = new();
+    internal readonly IntrusiveOpQueue<PutOp<T>> _putq;
+    internal readonly IntrusiveOpQueue<GetOp<T>> _getq;
 
+    
     // Object pooling is crucial here. In highly concurrent scenarios (like the ring benchmark), 
     // allocating new Operation objects for every message would cause massive GC pressure.
     // By pooling, we achieve zero-allocation steady-state message passing.
     internal readonly ObjectPool<PutOp<T>> _putPool = ObjectPool.Create<PutOp<T>>();
     internal readonly ObjectPool<GetOp<T>> _getPool = ObjectPool.Create<GetOp<T>>();
+
+    public Channel()
+    {
+        // Initialize queues passing the pools so they can grab their dummy nodes
+        _putq = new IntrusiveOpQueue<PutOp<T>>(_putPool);
+        _getq = new IntrusiveOpQueue<GetOp<T>>(_getPool);
+    }
+    
+    
+    
+    
 
     public void PublishSend(SyncState state, int eventId, T value, Action resumePut)
     {
