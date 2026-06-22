@@ -36,6 +36,55 @@ public class Channel<T>
 
     public void PublishSend(SyncState state, int eventId, T value, Action resumePut)
     {
+        // FAST PATH: Try to match without enqueueing ourselves
+        while (_getq.TryDequeue(out var getOp))
+        {
+            if (getOp.IsSynchronized) 
+            {
+                _getPool.Return(getOp);
+                continue;
+            }
+
+            if (state.TryClaim())
+            {
+                if (getOp.TrySync())
+                {
+                    var getResume = getOp.ResumeGet;
+                    state.MarkSynchronized(eventId);
+                    getOp.State.MarkSynchronized(getOp.EventId);
+
+                    var myResume = resumePut;
+                    T capturedValue = value;
+
+                    Scheduler.Enqueue(() => myResume());
+                    Scheduler.Enqueue(() => getResume(capturedValue));
+                    
+                    _getPool.Return(getOp);
+                    return;
+                }
+                else
+                {
+                    state.ResetClaim();
+                    if (getOp.IsSynchronized)
+                        _getPool.Return(getOp);
+                    else
+                    {
+                        _getq.Enqueue(getOp); 
+                        System.Threading.Thread.Yield();
+                    }
+                }
+            }
+            else
+            {
+                if (getOp.IsSynchronized)
+                    _getPool.Return(getOp);
+                else
+                    _getq.Enqueue(getOp);
+                return;
+            }
+        }
+
+        // SLOW PATH: We must enqueue ourselves and search again to prevent races
         var myOp = _putPool.Get();
         myOp.State = state;
         myOp.EventId = eventId;
@@ -88,7 +137,6 @@ public class Channel<T>
                     // or already fulfilled it (Synchronized).
                     // We MUST release our claim so that other threads can interact with our operation.
                     state.ResetClaim();
-                    
                     if (getOp.IsSynchronized)
                         _getPool.Return(getOp);
                     else
@@ -122,6 +170,56 @@ public class Channel<T>
 
     public void PublishReceive(SyncState state, int eventId, Action<T> resumeGet)
     {
+        // FAST PATH: Try to match without enqueueing ourselves
+        while (_putq.TryDequeue(out var putOp))
+        {
+            if (putOp.IsSynchronized) 
+            {
+                _putPool.Return(putOp);
+                continue;
+            }
+
+            if (state.TryClaim())
+            {
+                if (putOp.TrySync())
+                {
+                    T capturedValue = putOp.Value;
+                    var putResume = putOp.ResumePut;
+
+                    state.MarkSynchronized(eventId);
+                    putOp.State.MarkSynchronized(putOp.EventId);
+
+                    var myResume = resumeGet;
+
+                    Scheduler.Enqueue(() => putResume());
+                    Scheduler.Enqueue(() => myResume(capturedValue));
+
+                    _putPool.Return(putOp);
+                    return;
+                }
+                else
+                {
+                    state.ResetClaim();
+                    if (putOp.IsSynchronized)
+                        _putPool.Return(putOp);
+                    else
+                    {
+                        _putq.Enqueue(putOp);
+                        System.Threading.Thread.Yield();
+                    }
+                }
+            }
+            else
+            {
+                if (putOp.IsSynchronized)
+                    _putPool.Return(putOp);
+                else
+                    _putq.Enqueue(putOp);
+                return;
+            }
+        }
+
+        // SLOW PATH: Enqueue and search again
         var myOp = _getPool.Get();
         myOp.State = state;
         myOp.EventId = eventId;
