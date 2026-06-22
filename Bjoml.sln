@@ -2,10 +2,6 @@
 Microsoft Visual Studio Solution File, Format Version 12.00
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Bjoml", "Bjoml\Bjoml.csproj", "{A41688EE-37D9-4266-AF06-288FFA37EAEC}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "StressTest", "StressTest\StressTest.csproj", "{BC7D25BD-BD12-4B11-807F-FF39C06F51EC}"
-EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Example", "Example\Example.csproj", "{53FB4F73-FF93-457F-81D3-9EA6C9AED7D8}"
-EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -16,13 +12,5 @@ Global
 		{A41688EE-37D9-4266-AF06-288FFA37EAEC}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{A41688EE-37D9-4266-AF06-288FFA37EAEC}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{A41688EE-37D9-4266-AF06-288FFA37EAEC}.Release|Any CPU.Build.0 = Release|Any CPU
-		{BC7D25BD-BD12-4B11-807F-FF39C06F51EC}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
-		{BC7D25BD-BD12-4B11-807F-FF39C06F51EC}.Debug|Any CPU.Build.0 = Debug|Any CPU
-		{BC7D25BD-BD12-4B11-807F-FF39C06F51EC}.Release|Any CPU.ActiveCfg = Release|Any CPU
-		{BC7D25BD-BD12-4B11-807F-FF39C06F51EC}.Release|Any CPU.Build.0 = Release|Any CPU
-		{53FB4F73-FF93-457F-81D3-9EA6C9AED7D8}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
-		{53FB4F73-FF93-457F-81D3-9EA6C9AED7D8}.Debug|Any CPU.Build.0 = Debug|Any CPU
-		{53FB4F73-FF93-457F-81D3-9EA6C9AED7D8}.Release|Any CPU.ActiveCfg = Release|Any CPU
-		{53FB4F73-FF93-457F-81D3-9EA6C9AED7D8}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 EndGlobal
