@@ -37,11 +37,18 @@ public static class Cml
         ev.Publish(state, state.GenerateEventId(), continuation);
     }
 
-    public static Task<T> SyncAsync<T>(IEvent<T> ev)
+    public static ValueTask<T> SyncAsync<T>(IEvent<T> ev)
     {
-        var tcs = new TaskCompletionSource<T>();
-        Sync(ev, value => tcs.SetResult(value));
-        return tcs.Task;
+        var source = CmlValueTaskSource<T>.Rent();
+        Sync(ev, source.OnSyncDelegate);
+        return new ValueTask<T>(source, source.Version);
+    }
+
+    public static ValueTask SyncAsyncVoid(IEvent<Unit> ev)
+    {
+        var source = CmlValueTaskSource<Unit>.Rent();
+        Sync(ev, source.OnSyncDelegate);
+        return new ValueTask(source, source.Version);
     }
 
     // Combinators
@@ -170,7 +177,7 @@ public class AlwaysEvent<T> : IEvent<T>
         if (sharedState.TryClaim())
         {
             sharedState.MarkSynchronized(eventId);
-            Scheduler.Enqueue(() => onSync(_value));
+            Scheduler.Dispatch(onSync, _value);
         }
     }
 }

@@ -48,16 +48,16 @@ public static class MyServer
         private object _msg; 
         
         // Awaiter fields
-        private TaskAwaiter<object> _u1;
-        private TaskAwaiter _u2;
+        private ValueTaskAwaiter<object> _u1;
+        private ValueTaskAwaiter _u2;
 
         public void MoveNext()
         {
             int num = _state;
             try
             {
-                TaskAwaiter<object> getAwaiter;
-                TaskAwaiter putAwaiter;
+                ValueTaskAwaiter<object> getAwaiter;
+                ValueTaskAwaiter putAwaiter;
                 
                 while (true) // The original while(true) loop
                 {

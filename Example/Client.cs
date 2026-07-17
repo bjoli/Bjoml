@@ -45,16 +45,16 @@ public static class MyClient
         private object[] _messages;
         private int _index;
 
-        private TaskAwaiter _u1;
-        private TaskAwaiter<object> _u2;
+        private ValueTaskAwaiter _u1;
+        private ValueTaskAwaiter<object> _u2;
 
         public void MoveNext()
         {
             int num = _state;
             try
             {
-                TaskAwaiter putAwaiter;
-                TaskAwaiter<object> getAwaiter;
+                ValueTaskAwaiter putAwaiter;
+                ValueTaskAwaiter<object> getAwaiter;
 
                 if (num == 0)
                 {

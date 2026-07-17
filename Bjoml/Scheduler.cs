@@ -24,13 +24,101 @@ using Microsoft.Extensions.ObjectPool;
 
 public static class Scheduler
 {
-    public static void Enqueue(Action work) => ThreadPool.QueueUserWorkItem(_ => work());
-    public static void Start(int minWorkers = 0)
+    private static Worker[] _workers;
+    private static int _nextWorker = 0;
+
+    [ThreadStatic]
+    internal static Worker? CurrentWorker;
+
+    [ThreadStatic]
+    internal static int InlineDepth;
+
+    public static void Start(int numWorkers = 0)
     {
-        if (minWorkers > 0)
+        if (numWorkers <= 0) numWorkers = Environment.ProcessorCount;
+        _workers = new Worker[numWorkers];
+        for (int i = 0; i < numWorkers; i++)
         {
-            ThreadPool.GetMinThreads(out int currentMinWorker, out int currentMinIOC);
-            ThreadPool.SetMinThreads(Math.Max(minWorkers, currentMinWorker), currentMinIOC);
+            _workers[i] = new Worker(i);
+        }
+    }
+
+    public static void Enqueue(Action work)
+    {
+        var worker = CurrentWorker;
+        if (worker != null)
+        {
+            worker.Enqueue(work);
+        }
+        else
+        {
+            if (_workers == null) Start(); // Lazy init if missed
+            int index = Interlocked.Increment(ref _nextWorker) % _workers.Length;
+            if (index < 0) index += _workers.Length;
+            _workers[index].Enqueue(work);
+        }
+    }
+
+    public static void Dispatch(Action action)
+    {
+        if (InlineDepth < 50)
+        {
+            InlineDepth++;
+            try { action(); }
+            finally { InlineDepth--; }
+        }
+        else
+        {
+            Enqueue(action);
+        }
+    }
+
+    public static void Dispatch<T>(Action<T> action, T state)
+    {
+        if (InlineDepth < 50)
+        {
+            InlineDepth++;
+            try { action(state); }
+            finally { InlineDepth--; }
+        }
+        else
+        {
+            Enqueue(() => action(state));
+        }
+    }
+}
+
+internal class Worker
+{
+    private readonly BlockingCollection<Action> _queue = new BlockingCollection<Action>(new ConcurrentQueue<Action>());
+    private readonly Thread _thread;
+
+    public Worker(int id)
+    {
+        _thread = new Thread(RunLoop)
+        {
+            Name = $"BjoML-Worker-{id}",
+            IsBackground = true
+        };
+        _thread.Start();
+    }
+
+    public void Enqueue(Action work) => _queue.Add(work);
+
+    private void RunLoop()
+    {
+        Scheduler.CurrentWorker = this;
+        foreach (var action in _queue.GetConsumingEnumerable())
+        {
+            try
+            {
+                Scheduler.InlineDepth = 0;
+                action();
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"Worker unhandled exception: {ex}");
+            }
         }
     }
 }

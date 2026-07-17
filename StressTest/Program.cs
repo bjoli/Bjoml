@@ -32,7 +32,11 @@ class Program
 
         await RunRingBenchmark();
         Console.WriteLine();
+        await RunSimpleRingBenchmark();
+        Console.WriteLine();
         await RunProducerConsumerBenchmark();
+        Console.WriteLine();
+        await RunSimpleProducerConsumerBenchmark();
         Console.WriteLine();
         await RunCombinatorTest();
 
@@ -159,6 +163,115 @@ class Program
 
         sw.Stop();
         Console.WriteLine($"Producer/Consumer finished in {sw.ElapsedMilliseconds} ms. Total Messages Processed: {totalReceived}");
+    }
+
+    static async Task RunSimpleRingBenchmark()
+    {
+        const int numWorkers = 1000;
+        const int numTrips = 1000;
+
+        Console.WriteLine($"--- SimpleChannel Ring Benchmark: {numWorkers} workers, {numTrips} trips around the ring ---");
+        
+        var channels = new SimpleChannel<int>[numWorkers];
+        for (int i = 0; i < numWorkers; i++)
+        {
+            channels[i] = new SimpleChannel<int>();
+        }
+
+        var tasks = new Task[numWorkers];
+
+        for (int i = 0; i < numWorkers; i++)
+        {
+            int workerId = i;
+            var inChannel = channels[workerId];
+            var outChannel = channels[(workerId + 1) % numWorkers];
+
+            tasks[i] = Task.Run(async () =>
+            {
+                while (true)
+                {
+                    int msg = await inChannel.GetMessage();
+                    if (msg == -1) 
+                    {
+                        if (workerId != numWorkers - 1) 
+                        {
+                            await outChannel.PutMessage(-1);
+                        }
+                        break;
+                    }
+                    
+                    if (workerId == numWorkers - 1)
+                    {
+                        msg++;
+                        if (msg >= numTrips)
+                        {
+                            await outChannel.PutMessage(-1);
+                            continue;
+                        }
+                    }
+
+                    await outChannel.PutMessage(msg);
+                }
+            });
+        }
+
+        var sw = Stopwatch.StartNew();
+        await channels[0].PutMessage(0);
+        await Task.WhenAll(tasks);
+        sw.Stop();
+        Console.WriteLine($"SimpleChannel Ring Benchmark finished in {sw.ElapsedMilliseconds} ms. Passed {numWorkers * numTrips} messages.");
+    }
+
+    static async Task RunSimpleProducerConsumerBenchmark()
+    {
+        const int numProducers = 100;
+        const int numConsumers = 100;
+        const int messagesPerProducer = 5000;
+
+        Console.WriteLine($"--- SimpleChannel Fan-In / Fan-Out: {numProducers} Producers, {numConsumers} Consumers, {messagesPerProducer} msgs each ---");
+
+        var sharedChannel = new SimpleChannel<int>();
+        var producers = new Task[numProducers];
+        var consumers = new Task[numConsumers];
+        
+        int totalReceived = 0;
+
+        var sw = Stopwatch.StartNew();
+
+        for (int i = 0; i < numConsumers; i++)
+        {
+            consumers[i] = Task.Run(async () =>
+            {
+                while (true)
+                {
+                    int msg = await sharedChannel.GetMessage();
+                    if (msg == -1) break;
+                    System.Threading.Interlocked.Increment(ref totalReceived);
+                }
+            });
+        }
+
+        for (int i = 0; i < numProducers; i++)
+        {
+            producers[i] = Task.Run(async () =>
+            {
+                for (int j = 0; j < messagesPerProducer; j++)
+                {
+                    await sharedChannel.PutMessage(j);
+                }
+            });
+        }
+
+        await Task.WhenAll(producers);
+
+        for (int i = 0; i < numConsumers; i++)
+        {
+            await sharedChannel.PutMessage(-1);
+        }
+
+        await Task.WhenAll(consumers);
+        sw.Stop();
+        Console.WriteLine($"SimpleChannel Producer/Consumer finished in {sw.ElapsedMilliseconds} ms. Total Messages Processed: {totalReceived}");
     }
 
     static async Task RunCombinatorTest()

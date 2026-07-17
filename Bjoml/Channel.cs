@@ -56,8 +56,8 @@ public class Channel<T>
                     var myResume = resumePut;
                     T capturedValue = value;
 
-                    Scheduler.Enqueue(() => myResume());
-                    Scheduler.Enqueue(() => getResume(capturedValue));
+                    Scheduler.Dispatch(myResume);
+                    Scheduler.Dispatch(getResume, capturedValue);
                     
                     _getPool.Return(getOp);
                     return;
@@ -125,8 +125,8 @@ public class Channel<T>
 
                     // We dispatch the continuations to the ThreadPool. We do NOT run them inline because 
                     // inline execution could lead to unbounded stack growth or thread starvation if the continuations block.
-                    Scheduler.Enqueue(() => myResume());
-                    Scheduler.Enqueue(() => getResume(capturedValue));
+                    Scheduler.Dispatch(myResume);
+                    Scheduler.Dispatch(getResume, capturedValue);
                     
                     _getPool.Return(getOp);
                     return;
@@ -191,8 +191,8 @@ public class Channel<T>
 
                     var myResume = resumeGet;
 
-                    Scheduler.Enqueue(() => putResume());
-                    Scheduler.Enqueue(() => myResume(capturedValue));
+                    Scheduler.Dispatch(putResume);
+                    Scheduler.Dispatch(myResume, capturedValue);
 
                     _putPool.Return(putOp);
                     return;
@@ -249,8 +249,8 @@ public class Channel<T>
 
                     var myResume = resumeGet;
 
-                    Scheduler.Enqueue(() => putResume());
-                    Scheduler.Enqueue(() => myResume(capturedValue));
+                    Scheduler.Dispatch(putResume);
+                    Scheduler.Dispatch(myResume, capturedValue);
 
                     _putPool.Return(putOp);
                     return;
