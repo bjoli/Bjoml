@@ -83,7 +83,6 @@ class Program
                     {
                         // Completed a trip
                         msg++;
-                        if (msg % 100 == 0) Console.WriteLine($"Completed {msg} trips...");
                         if (msg >= numTrips)
                         {
                             // Reached the limit, send poison pill
