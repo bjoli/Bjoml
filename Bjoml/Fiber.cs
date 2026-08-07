@@ -100,15 +100,12 @@ internal sealed class FiberStateMachineBox<TStateMachine> : IThreadPoolWorkItem
 // copied around; this reference is what actually persists.
 // ---------------------------------------------------------------------------
 
-public sealed class FiberCore<T>
+public sealed class FiberCore<T> : Promise<T>
 {
-    private readonly Promise<T> _promise = new();
     private object? _box;
 
-    public Promise<T> Promise => _promise;
-
-    public void SetResult(T value) => _promise.TrySetResult(value);
-    public void SetException(Exception e) => _promise.TrySetException(e);
+    public void SetResult(T value) => TrySetResult(value);
+    public void SetException(Exception e) => TrySetException(e);
 
     /// <summary>
     /// Get the delegate that resumes this fiber, boxing the state machine on first
@@ -157,9 +154,9 @@ public readonly struct Fiber<T>
     internal Fiber(FiberCore<T> core) => Core = core;
 
     /// <summary>The first-class handle. This is what <c>spawn</c> hands to the language.</summary>
-    public Promise<T> AsPromise() => Core.Promise;
+    public Promise<T> AsPromise() => Core;
 
-    public PromiseAwaiter<T> GetAwaiter() => Core.Promise.GetAwaiter();
+    public PromiseAwaiter<T> GetAwaiter() => Core.GetAwaiter();
 }
 
 /// <summary>Return type of a compiled bjoroutine with no useful value.</summary>
@@ -169,9 +166,9 @@ public readonly struct Fiber
     internal readonly FiberCore<Unit> Core;
     internal Fiber(FiberCore<Unit> core) => Core = core;
 
-    public Promise<Unit> AsPromise() => Core.Promise;
+    public Promise<Unit> AsPromise() => Core;
 
-    public PromiseAwaiter<Unit> GetAwaiter() => Core.Promise.GetAwaiter();
+    public PromiseAwaiter<Unit> GetAwaiter() => Core.GetAwaiter();
 }
 
 // ---------------------------------------------------------------------------

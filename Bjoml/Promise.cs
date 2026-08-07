@@ -87,18 +87,15 @@ internal interface IPromiseWaiter
 /// STARVATION WARNING: a completed promise inside a <c>choose</c> loop wins every
 /// iteration, exactly like <c>Cml.Always</c>. Document this for language users.
 /// </summary>
-public sealed class Promise<T> : IEvent<Result<T>>
+public class Promise<T> : IEvent<Result<T>>
 {
-    private const int Pending = 0;
-    private const int Completed = 1;
+    private static readonly object s_completedSentinel = new();
 
-    private readonly object _lock = new();
-    private int _state = Pending;
+    private object? _waiters;
     private T _value = default!;
     private ExceptionDispatchInfo? _error;
-    private List<IPromiseWaiter>? _waiters;
 
-    public bool IsCompleted => Volatile.Read(ref _state) == Completed;
+    public bool IsCompleted => ReferenceEquals(Volatile.Read(ref _waiters), s_completedSentinel);
 
     public bool TrySetResult(T value) => Complete(value, null);
 
@@ -108,31 +105,27 @@ public sealed class Promise<T> : IEvent<Result<T>>
 
     private bool Complete(T value, ExceptionDispatchInfo? error)
     {
-        List<IPromiseWaiter>? toRun;
-        lock (_lock)
+        _value = value;
+        _error = error;
+
+        var oldWaiters = Interlocked.Exchange(ref _waiters, s_completedSentinel);
+        if (ReferenceEquals(oldWaiters, s_completedSentinel)) return false;
+
+        if (oldWaiters != null)
         {
-            if (_state == Completed) return false;
-
-            _value = value;
-            _error = error;
-
-            // Release: publishes _value/_error to any thread that subsequently reads
-            // IsCompleted, which is an acquiring read.
-            Volatile.Write(ref _state, Completed);
-
-            toRun = _waiters;
-            _waiters = null;
-        }
-
-        if (toRun != null)
-        {
-            foreach (var w in toRun)
+            if (oldWaiters is IPromiseWaiter single)
             {
-                // Enqueue rather than run inline: the completing thread may be a
-                // foreign one (a Task continuation, a timer) that we should not
-                // borrow for arbitrary fiber code, and inline completion here would
-                // let one promise chain grow the stack without bound.
-                if (!w.IsAbandoned) Scheduler.Enqueue(w.Signal);
+                if (!single.IsAbandoned) Scheduler.Enqueue(single.Signal);
+            }
+            else if (oldWaiters is List<IPromiseWaiter> list)
+            {
+                lock (list)
+                {
+                    foreach (var w in list)
+                    {
+                        if (!w.IsAbandoned) Scheduler.Enqueue(w.Signal);
+                    }
+                }
             }
         }
 
@@ -143,24 +136,47 @@ public sealed class Promise<T> : IEvent<Result<T>>
 
     internal void Register(IPromiseWaiter waiter)
     {
-        lock (_lock)
+        SpinWait spin = default;
+        while (true)
         {
-            if (_state != Completed)
+            var current = Volatile.Read(ref _waiters);
+            if (ReferenceEquals(current, s_completedSentinel))
             {
-                _waiters ??= new List<IPromiseWaiter>();
-
-                // Drop waiters belonging to sync blocks that have since been won by
-                // another branch. This is what bounds the list on a long-lived
-                // promise that is repeatedly offered in a choose and repeatedly loses.
-                if (_waiters.Count >= 8)
-                    _waiters.RemoveAll(static w => w.IsAbandoned);
-
-                _waiters.Add(waiter);
+                if (!waiter.IsAbandoned) waiter.Signal();
                 return;
             }
-        }
 
-        if (!waiter.IsAbandoned) waiter.Signal();
+            if (current == null)
+            {
+                if (Interlocked.CompareExchange(ref _waiters, waiter, null) == null)
+                    return;
+            }
+            else if (current is IPromiseWaiter single)
+            {
+                var list = new List<IPromiseWaiter>(4) { single, waiter };
+                if (Interlocked.CompareExchange(ref _waiters, list, single) == single)
+                    return;
+            }
+            else if (current is List<IPromiseWaiter> list)
+            {
+                lock (list)
+                {
+                    if (ReferenceEquals(Volatile.Read(ref _waiters), s_completedSentinel))
+                    {
+                        if (!waiter.IsAbandoned) waiter.Signal();
+                        return;
+                    }
+
+                    if (list.Count >= 8)
+                        list.RemoveAll(static w => w.IsAbandoned);
+
+                    list.Add(waiter);
+                    return;
+                }
+            }
+
+            spin.SpinOnce();
+        }
     }
 
     /// <summary>Run <paramref name="k"/> now if already complete, else on completion.</summary>
