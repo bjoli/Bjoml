@@ -309,9 +309,8 @@ public static class CmlTests
 
         int stranded = idle.PendingReceiveCount;
 
-        Assert(stranded >= iterations,
-            $"B7 appears to be FIXED: only {stranded} stale ops after {iterations} losing " +
-            "branches. Update this characterisation test to assert boundedness instead.");
+        Assert(stranded == 0,
+            $"Expected 0 stale ops after cleaning, but got {stranded}");
     }
 
     // -----------------------------------------------------------------------

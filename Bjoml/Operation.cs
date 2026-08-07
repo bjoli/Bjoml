@@ -15,65 +15,120 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with BjoML.  If not, see <https://www.gnu.org/licenses/>.
 
-using Microsoft.Extensions.ObjectPool;
+using System;
 
 namespace Bjoml;
 
 public abstract class Operation
 {
-    // Every queued operation holds a reference to the SyncState of the 'Cml.Sync' block that created it.
-    // By locking and mutating this shared state, we pair operations atomically.
-    // Assigned by the channel immediately after renting from the pool, never by a
-    // constructor, hence the null-forgiving initialiser.
     public SyncState State = null!;
-    
-    // The specific EventId for this branch in a 'Choose' block. 
-    // This allows the SyncState to know which branch won, so it can fire the NACKs for the losers.
     public int EventId;
 
     public bool IsSynchronized => State.IsSynchronized;
 
-    /// <summary>
-    /// Drive this (the opposing party's) block straight to Synchronized. The caller
-    /// must already hold a claim on its own block.
-    /// </summary>
     public bool TrySync() => State.TrySync();
 }
 
-/// <summary>
-/// Represents a pending 'Put' (Send) operation sitting in a channel's queue.
-/// We implement IResettable so these objects can be reused by the ObjectPool, 
-/// avoiding garbage collection overhead during millions of channel communications.
-/// </summary>
-public class PutOp<T> : Operation, IResettable
+public sealed class PutOp<T> : Operation
 {
+    private const int MaxCached = 64;
+    [ThreadStatic] private static PutOp<T>? _free;
+    [ThreadStatic] private static int _freeCount;
+
     public T Value = default!;
     public Action ResumePut = null!;
+    public PutOp<T>? Next;
 
-    public bool TryReset()
+    public static PutOp<T> Rent(SyncState state, int eventId, T value, Action resumePut)
     {
-        // Clear references so they can be garbage collected. 
-        // This is crucial to avoid memory leaks of the captured values or continuations while the object sits in the pool.
+        var op = _free;
+        if (op is null)
+        {
+            return new PutOp<T>
+            {
+                State = state,
+                EventId = eventId,
+                Value = value,
+                ResumePut = resumePut
+            };
+        }
+
+        _free = op.Next;
+        _freeCount--;
+        op.Next = null;
+        op.State = state;
+        op.EventId = eventId;
+        op.Value = value;
+        op.ResumePut = resumePut;
+        return op;
+    }
+
+    public void Recycle()
+    {
+        State = null!;
         Value = default!;
         ResumePut = null!;
-        State = null!; 
         EventId = 0;
-        return true;
+
+        if (_freeCount < MaxCached)
+        {
+            Next = _free;
+            _free = this;
+            _freeCount++;
+        }
+        else
+        {
+            Next = null;
+        }
     }
 }
 
-/// <summary>
-/// Represents a pending 'Get' (Receive) operation sitting in a channel's queue.
-/// </summary>
-public class GetOp<T> : Operation, IResettable
+public sealed class GetOp<T> : Operation
 {
-    public Action<T> ResumeGet = null!;
+    private const int MaxCached = 64;
+    [ThreadStatic] private static GetOp<T>? _free;
+    [ThreadStatic] private static int _freeCount;
 
-    public bool TryReset()
+    public Action<T> ResumeGet = null!;
+    public GetOp<T>? Next;
+
+    public static GetOp<T> Rent(SyncState state, int eventId, Action<T> resumeGet)
     {
+        var op = _free;
+        if (op is null)
+        {
+            return new GetOp<T>
+            {
+                State = state,
+                EventId = eventId,
+                ResumeGet = resumeGet
+            };
+        }
+
+        _free = op.Next;
+        _freeCount--;
+        op.Next = null;
+        op.State = state;
+        op.EventId = eventId;
+        op.ResumeGet = resumeGet;
+        return op;
+    }
+
+    public void Recycle()
+    {
+        State = null!;
         ResumeGet = null!;
-        State = null!; 
         EventId = 0;
-        return true;
+
+        if (_freeCount < MaxCached)
+        {
+            Next = _free;
+            _free = this;
+            _freeCount++;
+        }
+        else
+        {
+            Next = null;
+        }
     }
 }

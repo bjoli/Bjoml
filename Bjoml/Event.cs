@@ -34,9 +34,6 @@ public static class Cml
     public static void Sync<T>(IEvent<T> ev, Action<T> continuation)
     {
         var state = new SyncState();
-
-        // The root of the event-id tree. Every id minted below this one is a
-        // descendant of it, so a nack attached at the root never fires.
         ev.Publish(state, SyncState.RootEventId, continuation);
     }
 
@@ -82,11 +79,8 @@ public class ChooseEvent<T> : IEvent<T>
 
     public void Publish(SyncState sharedState, int eventId, Action<T> onSync)
     {
-        // Each branch gets a NEW event id, because if branch A wins we must fire the
-        // nacks for B and C. The id is minted as a CHILD of the incoming id rather
-        // than from a flat counter: an enclosing withNack identifies its subtree by
-        // its own id, and if choose reparented its branches to nowhere, that
-        // withNack would fire its nack even when one of its own branches won.
+        // Each branch gets a distinct sequential event index.
+        // Hopac interval indexing: subtrees are tracked by range [I0, I1) on the SyncState.
         foreach (var ev in _events)
         {
             // An earlier branch may have committed inline (Always, an already-queued
@@ -94,7 +88,7 @@ public class ChooseEvent<T> : IEvent<T>
             // operations that can never win.
             if (sharedState.IsSynchronized) return;
 
-            ev.Publish(sharedState, sharedState.GenerateChildId(eventId), onSync);
+            ev.Publish(sharedState, sharedState.NextEventId(), onSync);
         }
     }
 }
@@ -166,20 +160,33 @@ public class WithNackEvent<T> : IEvent<T>
         // PERSISTENT, which is also the better semantics: "this branch lost" is a
         // fact, not a message, so every listener should see it and a listener that
         // arrives late should still see it.
+        int i0 = eventId;
         var nack = new Promise<Unit>();
 
-        // Bound specifically to OUR eventId. The shared state fires this only if it
-        // is synchronized by an event OUTSIDE our subtree.
-        sharedState.RegisterNack(eventId, () => nack.TrySetResult(default));
+        // Register Nack interval starting at i0.
+        var nackNode = sharedState.RegisterNack(i0, () => nack.TrySetResult(default));
 
         // A nack promise is only ever completed successfully, so the Result wrapper
         // can be projected away.
         var ev = _generator(Cml.Wrap(nack.Join(), static r => r.Value));
         
-        // Publish the generated event WITH OUR EVENT ID. 
-        // This means if `ev` wins, it identifies itself to the SyncState using our eventId, 
-        // which tells the SyncState NOT to fire our registered NACK!
+        // Publish the generated event with our starting eventId.
         ev.Publish(sharedState, eventId, onSync);
+
+        // Subtree ends after the last minted branch index.
+        int i1 = Math.Max(sharedState.CurrentEventId, i0 + 1);
+        if (nackNode != null)
+        {
+            nackNode.I1 = i1;
+            if (sharedState.IsSynchronized)
+            {
+                int winner = sharedState.WinningEventId;
+                if (winner < i0 || i1 <= winner)
+                {
+                    nack.TrySetResult(default);
+                }
+            }
+        }
     }
 }
 

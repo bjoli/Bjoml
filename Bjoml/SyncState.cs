@@ -16,10 +16,29 @@
 // along with BjoML.  If not, see <https://www.gnu.org/licenses/>.
 
 using System;
-using System.Collections.Generic;
 using System.Threading;
 
 namespace Bjoml;
+
+/// <summary>
+/// An intrusive singly-linked record for negative acknowledgements (NACKs).
+/// Follows Hopac's interval-based choice tracking: each NACK guards an index interval [I0, I1).
+/// </summary>
+public sealed class NackNode
+{
+    public readonly Action Action;
+    public readonly int I0;
+    public int I1;
+    public NackNode? Next;
+
+    public NackNode(Action action, int i0, NackNode? next)
+    {
+        Action = action;
+        I0 = i0;
+        I1 = int.MaxValue;
+        Next = next;
+    }
+}
 
 /// <summary>
 /// The lock-free state machine shared by every branch of one <c>Cml.Sync</c> block.
@@ -32,10 +51,10 @@ namespace Bjoml;
 /// <item><c>S</c> Synchronized — paired, terminal.</item>
 /// </list>
 ///
-/// Event ids form a TREE, not a flat set: <c>choose</c> mints children,
-/// <c>wrap</c>/<c>guard</c> pass the id through unchanged, and <c>withNack</c>
-/// attaches a nack to an interior node. A nack must fire only when the winner lies
-/// OUTSIDE the subtree it guards.
+/// Borrowed from Hopac Core: choice branches are indexed with sequential integers 0, 1, 2, ...
+/// Subtrees are tracked as contiguous intervals [I0, I1). A nack fires only when the
+/// winning branch index lies OUTSIDE [I0, I1), completely avoiding dictionary allocations,
+/// tree hashing, and locks for ID generation.
 /// </summary>
 public class SyncState
 {
@@ -43,66 +62,25 @@ public class SyncState
     public const int C = 1;
     public const int S = 2;
 
-    /// <summary>Root of the event-id tree. Ancestor of every other id.</summary>
+    /// <summary>Root event index.</summary>
     public const int RootEventId = 0;
 
     private int _value = W;
     private int _eventIdCounter = RootEventId;
+    private int _winningEventId = -1;
 
-    // Both collections are allocated ON DEMAND, and this matters a lot: a SyncState
-    // is created for EVERY Cml.Sync, including a bare channel receive that has no
-    // choose branches and no nacks. Allocating a Dictionary and a List up front cost
-    // ~136 bytes on every single message for state the overwhelming majority of
-    // syncs never touch.
-    //
-    //   _parents is needed only by choose (GenerateChildId).
-    //   _nacks   is needed only by withNack (RegisterNack).
-    //
-    // We lock on `this` rather than on a dedicated lock object, for the same reason:
-    // a separate object would be one more allocation per sync. SyncState is a
-    // synchronisation primitive that nothing else locks on, so the usual objection
-    // to lock(this) does not apply here. One monitor covers both collections; they
-    // are only ever taken together (MarkSynchronized walks the id tree while holding
-    // the nack list) and a single reentrant monitor removes any ordering hazard.
-    // Contention is per-sync-block, i.e. essentially nil.
+    // Intrusive singly-linked list of NACKs.
+    // Allocated on demand only when withNack is actually used.
+    private NackNode? _nacks;
 
-    // child id -> parent id. Root is implicit and never present.
-    private Dictionary<int, int>? _parents;
+    /// <summary>The next event index to be minted.</summary>
+    public int CurrentEventId => Volatile.Read(ref _eventIdCounter);
 
-    // A LIST, not a dictionary keyed by id. Two withNacks can legitimately share an
-    // id, because withNack publishes its generated event with its own id; keying by
-    // id let the inner one silently overwrite and discard the outer one's nack.
-    private List<(int EventId, Action Nack)>? _nacks;
+    /// <summary>The winning event ID that synchronized this state.</summary>
+    public int WinningEventId => Volatile.Read(ref _winningEventId);
 
-    /// <summary>Mint a fresh id as a child of <paramref name="parentId"/>.</summary>
-    public int GenerateChildId(int parentId)
-    {
-        int id = Interlocked.Increment(ref _eventIdCounter);
-        lock (this) (_parents ??= new Dictionary<int, int>())[id] = parentId;
-        return id;
-    }
-
-    /// <summary>
-    /// Is <paramref name="candidate"/> equal to, or an ancestor of,
-    /// <paramref name="winner"/>? If so, the winner is inside the candidate's
-    /// subtree and the candidate's nack must NOT fire.
-    /// </summary>
-    private bool CoversWinner(int candidate, int winner)
-    {
-        lock (this)
-        {
-            int node = winner;
-            while (true)
-            {
-                if (candidate == node) return true;
-                if (node == RootEventId) return false;
-
-                // No _parents means no choose ever minted a child, so the only id
-                // that can cover the winner is the winner itself, already checked.
-                if (_parents == null || !_parents.TryGetValue(node, out node)) return false;
-            }
-        }
-    }
+    /// <summary>Mint a fresh sequential leaf/branch id.</summary>
+    public int NextEventId() => Interlocked.Increment(ref _eventIdCounter) - 1;
 
     // ---- state transitions -------------------------------------------------
 
@@ -159,40 +137,57 @@ public class SyncState
     /// </summary>
     public void MarkSynchronized(int winningEventId)
     {
+        _winningEventId = winningEventId;
         Volatile.Write(ref _value, S);
 
-        List<Action>? toFire = null;
+        NackNode? toFireHead = null;
         lock (this)
         {
-            if (_nacks != null)
+            var curr = _nacks;
+            _nacks = null;
+            while (curr != null)
             {
-                for (int i = 0; i < _nacks.Count; i++)
+                var next = curr.Next;
+                if (winningEventId < curr.I0 || curr.I1 <= winningEventId)
                 {
-                    var (id, nack) = _nacks[i];
-                    if (!CoversWinner(id, winningEventId))
-                        (toFire ??= new List<Action>()).Add(nack);
+                    curr.Next = toFireHead;
+                    toFireHead = curr;
                 }
-                _nacks.Clear();
+                curr = next;
             }
         }
 
-        if (toFire != null)
-            foreach (var a in toFire) Scheduler.Enqueue(a);
+        while (toFireHead != null)
+        {
+            Scheduler.Enqueue(toFireHead.Action);
+            toFireHead = toFireHead.Next;
+        }
     }
 
-    public void RegisterNack(int eventId, Action nack)
+    /// <summary>
+    /// Register a NACK callback for the interval starting at <paramref name="i0"/>.
+    /// Returns the <see cref="NackNode"/> whose <c>I1</c> should be updated after
+    /// publishing the guarded subtree.
+    /// </summary>
+    public NackNode? RegisterNack(int i0, Action nack)
     {
         lock (this)
         {
             if (!IsSynchronized)
             {
-                (_nacks ??= new List<(int, Action)>()).Add((eventId, nack));
-                return;
+                var node = new NackNode(nack, i0, _nacks);
+                _nacks = node;
+                return node;
             }
         }
 
-        // Another branch won before we finished publishing this one, so nobody will
-        // ever walk the list on our behalf. Fire it now.
-        Scheduler.Enqueue(nack);
+        // Another branch won before we finished publishing this one.
+        // Fire it now if the winning event is outside [i0, +inf).
+        if (_winningEventId < i0)
+        {
+            Scheduler.Enqueue(nack);
+        }
+
+        return null;
     }
 }
