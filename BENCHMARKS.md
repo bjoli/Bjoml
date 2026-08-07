@@ -385,6 +385,88 @@ charging ~60 ns for.
 than the CML ring; the ring is a single hot chain where the CML path's inline
 dispatch already avoids most scheduler traffic.
 
+## Hopac comparison
+
+`bench/hopac` is the same six benchmarks written against Hopac 0.5.1, shaped
+identically. Hopac is the reference point that matters most: it is also CML, also on
+.NET, also on a work-stealing scheduler, and it has had years of tuning. Go tells us
+what a mature runtime with language support achieves; **Hopac tells us what the same
+idea costs on the same platform**, which is what BjoML should actually be judged
+against.
+
+Medians of 3, ns/op, with bytes allocated per operation:
+
+| Benchmark | BjoML | B/op | Hopac | B/op | Go |
+|---|---|---|---|---|---|
+| Spawn storm (from a foreign thread) | **110** | 89 | 2163 | 72 | — |
+| Spawn storm (from inside the runtime) | **100** | 89 | 212 | 184 | 201 |
+| Spawn+send | **590** | 377 | 1076 | 304 | 1778 |
+| Ping-pong | 193 | **0** | 191 | 672 | 162 |
+| Ring | **62** | **0** | 76 | 296 | 90 |
+| Select/Choose | 211 | 40 | **141** | 528 | 134 |
+| Fan-out | 113 ms | — | **112 ms** | — | 120 ms |
+
+### A fairness bug in the earlier suite, now fixed
+
+The spawn storm had been measuring different things in different languages. In Go,
+`main` *is* a goroutine, so `go func()` pushes onto a local run queue and never
+touches a shared structure. In the C# and F# versions the producer was an ordinary
+thread, so every spawn crossed a shared queue. Those are not the same measurement,
+and Go's number was quietly getting the easy path.
+
+`Spawn storm inside` is the comparable row, and adding it changed the conclusion.
+
+### Hopac has a 10x cliff on foreign-thread spawns; BjoML does not
+
+**2163 ns/op from a foreign thread against 212 from inside a job.** Hopac's `queue`
+from outside the runtime takes the global work stack's `SpinlockTTAS`, once per
+spawn, while 24 workers spin on the same lock trying to pull work out. Hopac's own
+source comments on that spinlock predict this exactly: "on every change of owner this
+spinlock implementation requires Omega(n) cache line transfers ... and is thus
+inherently unscalable". It is fine in normal Hopac use, because Hopac code spawns
+from inside jobs onto an unsynchronised worker-local stack.
+
+BjoML has no such cliff — 110 foreign against 100 inside — and the reason is
+`SpawnBatch`. This is the strongest evidence yet for keeping it. It had been
+described in this document as a workaround for the .NET thread pool; it is better
+understood as **the fix for a cliff that the mature comparable runtime still has**.
+An embedded language runtime is called from foreign threads constantly (the entry
+point, `Task` continuations, host callbacks), so this is not a benchmark artifact.
+
+Independent confirmation: the `trial/own-workers` branch reproduced Hopac's cliff
+almost exactly. Hand-written workers with a global queue measured 299 ns/op for the
+same storm without batching, and 109 with it.
+
+### Where Hopac is better, and it is worth taking seriously
+
+**Select/Choose: 141 vs 211.** Hopac is 33% faster at the operation that is the whole
+point of CML, while allocating 528 B/op against BjoML's 40. So it is not winning by
+being cheap — its `Alt` machinery is simply better than BjoML's `SyncState`. That is
+the clearest optimisation target in the codebase.
+
+### Where BjoML is better
+
+**Allocation, by an order of magnitude.** Ping-pong 0 B/op against 672, ring 0 against
+296, select 40 against 528. Hopac's `job` computation expression allocates
+continuation objects per bind; BjoML's compiled async state machine is allocated once
+per fiber and then reused across every suspension. This is the structural advantage
+of building on `IAsyncStateMachine`, and it shows up as lower GC pressure rather than
+lower latency — the two runtimes are within noise of each other on ping-pong wall
+time despite the 672:0 allocation ratio.
+
+**Spawning, roughly 2x**: 100 vs 212 inside, and 20x foreign.
+
+**Ring, 62 vs 76**, with zero allocation.
+
+### Caveats
+
+- Hopac's `Spawn+send` is as noisy as Go's (695, 3334, 1076 across three runs) and
+  for the same reason: 200 000 senders convoying on one unbuffered channel. Treat
+  that row as non-evidence for all three runtimes.
+- Hopac 0.5.1 predates .NET 10 and is running on a runtime it was never tuned for.
+- Only the C# suite reports `SimpleChannel`; there is no Hopac equivalent because
+  Hopac's `Ch` is always a composable `Alt`.
+
 ## What is left on the table
 
 - **~30 ns of BjoML overhead per spawn** (216 vs 185 raw pool, pre-batching).

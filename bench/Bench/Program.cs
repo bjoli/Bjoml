@@ -27,6 +27,7 @@ public static class Program
         await Warmup();
 
         await SpawnStorm();
+        await SpawnStormInside();
         await SpawnAndSend();
         await PingPong();
         await Ring();
@@ -102,6 +103,42 @@ public static class Program
         long alloc = GC.GetTotalAllocatedBytes(precise: true) - before;
 
         Report("Spawn storm", n, sw, alloc, $"counter={Interlocked.Read(ref _counter)}");
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// The same storm with the producer loop running INSIDE a fiber.
+    ///
+    /// The original suite was not fair on this point. In Go, <c>main</c> is itself a
+    /// goroutine, so <c>go func()</c> pushes onto a local run queue and never touches
+    /// anything shared. Here the producer was an <c>async Task</c> — a foreign thread
+    /// as far as the runtime is concerned — so every spawn crossed a shared queue.
+    /// Those are different measurements, and this is the one comparable to Go's.
+    /// </summary>
+    static async Fiber StormParent(int n, Func<Fiber> body)
+    {
+        for (int i = 0; i < n; i++) Bjo.Spawn(body);
+    }
+
+    static Task SpawnStormInside()
+    {
+        const int n = 1_000_000;
+        _counter = 0;
+        _remaining = n;
+        _allDone.Reset();
+
+        Func<Fiber> body = () => Bump();
+
+        long before = GC.GetTotalAllocatedBytes(precise: true);
+        var sw = Stopwatch.StartNew();
+
+        Bjo.Spawn(() => StormParent(n, body));
+        _allDone.Wait();
+
+        sw.Stop();
+        long alloc = GC.GetTotalAllocatedBytes(precise: true) - before;
+
+        Report("Spawn storm inside", n, sw, alloc, $"counter={Interlocked.Read(ref _counter)}");
         return Task.CompletedTask;
     }
 
