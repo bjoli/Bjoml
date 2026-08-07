@@ -23,6 +23,7 @@ func main() {
 	spawnAndSend()
 	pingPong()
 	ring()
+	selectChoose()
 	fanOut()
 }
 
@@ -159,7 +160,40 @@ func ring() {
 		float64(elapsed.Nanoseconds())/float64(numWorkers*numTrips))
 }
 
-// 5. Fan-out: one goroutine spawns N children each doing a fixed slab of CPU work.
+// 5. Select / Choose: 1,000,000 operations choosing between two channels.
+func selectChoose() {
+	const rounds = 1_000_000
+	a := make(chan int)
+	b := make(chan int)
+	done := make(chan struct{})
+
+	go func() {
+		for i := 0; i < rounds; i++ {
+			if i%2 == 0 {
+				a <- i
+			} else {
+				b <- i
+			}
+		}
+		close(done)
+	}()
+
+	start := time.Now()
+	for i := 0; i < rounds; i++ {
+		select {
+		case <-a:
+		case <-b:
+		}
+	}
+	<-done
+	elapsed := time.Since(start)
+
+	fmt.Printf("Select/Choose:    %d ops in %v (%.0f ns/op)\n",
+		rounds, elapsed.Round(time.Millisecond),
+		float64(elapsed.Nanoseconds())/float64(rounds))
+}
+
+// 6. Fan-out: one goroutine spawns N children each doing a fixed slab of CPU work.
 //    Measures whether the scheduler spreads children across cores.
 func fanOut() {
 	const numChildren = 480

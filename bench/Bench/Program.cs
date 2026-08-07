@@ -30,6 +30,7 @@ public static class Program
         await SpawnAndSend();
         await PingPong();
         await Ring();
+        await SelectChoose();
         await FanOut();
     }
 
@@ -222,7 +223,44 @@ public static class Program
     }
 
     // ---------------------------------------------------------------------
-    // 5. Fan-out
+    // 5. Select / Choose
+    // ---------------------------------------------------------------------
+
+    static async Fiber SelectSender(Channel<int> a, Channel<int> b, int rounds)
+    {
+        for (int i = 0; i < rounds; i++)
+        {
+            if (i % 2 == 0) await a.Send(i);
+            else await b.Send(i);
+        }
+    }
+
+    static async Task SelectChoose()
+    {
+        const int rounds = 1_000_000;
+        var a = new Channel<int>();
+        var b = new Channel<int>();
+
+        var sender = Bjo.Spawn(() => SelectSender(a, b, rounds));
+
+        long before = GC.GetTotalAllocatedBytes(precise: true);
+        var sw = Stopwatch.StartNew();
+
+        var choose = Cml.Choose(a, b);
+        for (int i = 0; i < rounds; i++)
+        {
+            await Cml.SyncAsync(choose);
+        }
+
+        await sender.ToTask();
+        sw.Stop();
+        long alloc = GC.GetTotalAllocatedBytes(precise: true) - before;
+
+        Report("Select/Choose", rounds, sw, alloc, "ops");
+    }
+
+    // ---------------------------------------------------------------------
+    // 6. Fan-out
     // ---------------------------------------------------------------------
 
     static async Fiber Burn(int iterations)
