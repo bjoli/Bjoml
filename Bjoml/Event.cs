@@ -25,8 +25,10 @@ public interface IEvent<T>
     void Publish(SyncState sharedState, int eventId, Action<T> onSync);
 }
 
-// Dummy type for Unit since C# doesn't have it natively.
-public struct Unit { }
+public readonly struct Unit
+{
+    public static readonly Unit Value = default;
+}
 
 public static class Cml
 {
@@ -228,6 +230,8 @@ public class ChannelSendEvent<T> : IEvent<Unit>
         _value = value;
     }
 
+    public ChannelSendAwaiter<T> GetAwaiter() => new(_channel, _value);
+
     public void Publish(SyncState sharedState, int eventId, Action<Unit> onSync)
     {
         _channel.PublishSend(sharedState, eventId, _value, () => onSync(new Unit()));
@@ -242,6 +246,8 @@ public class ChannelReceiveEvent<T> : IEvent<T>
     {
         _channel = channel;
     }
+
+    public ChannelReceiveAwaiter<T> GetAwaiter() => new(_channel);
 
     public void Publish(SyncState sharedState, int eventId, Action<T> onSync)
     {

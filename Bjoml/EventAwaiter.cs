@@ -92,7 +92,7 @@ public sealed class EventAwaiter<T> : ICriticalNotifyCompletion
 /// <summary>Convenience constructors for the common channel operations.</summary>
 public static class ChannelEvents
 {
-    public static IEvent<T> Receive<T>(this Channel<T> ch) => new ChannelReceiveEvent<T>(ch);
+    public static ChannelReceiveOperation<T> Receive<T>(this Channel<T> ch) => ch.Receive();
 
-    public static IEvent<Unit> Send<T>(this Channel<T> ch, T value) => new ChannelSendEvent<T>(ch, value);
+    public static ChannelSendOperation<T> Send<T>(this Channel<T> ch, T value) => ch.Send(value);
 }

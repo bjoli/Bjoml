@@ -16,16 +16,28 @@
 // along with BjoML.  If not, see <https://www.gnu.org/licenses/>.
 
 using System;
+using System.Runtime.CompilerServices;
 
 namespace Bjoml;
 
-public class Channel<T>
+public class Channel<T> : IEvent<T>
 {
     private readonly object _lock = new();
     private PutOp<T>? _giversHead;
     private PutOp<T>? _giversTail;
     private GetOp<T>? _takersHead;
     private GetOp<T>? _takersTail;
+
+    public void Publish(SyncState state, int eventId, Action<T> onSync)
+    {
+        PublishReceive(state, eventId, onSync);
+    }
+
+    public ChannelReceiveAwaiter<T> GetAwaiter() => new(this);
+
+    public ChannelReceiveOperation<T> Receive() => new(this);
+
+    public ChannelSendOperation<T> Send(T value) => new(this, value);
 
     /// <summary>
     /// Number of parked receive operations. Cleans stale entries and returns active count.
@@ -78,7 +90,7 @@ public class Channel<T>
         while (curr != null)
         {
             var next = curr.Next;
-            if (curr.IsSynchronized)
+            if (curr.State != null && curr.IsSynchronized)
             {
                 if (prev == null) _takersHead = next;
                 else prev.Next = next;
@@ -102,7 +114,7 @@ public class Channel<T>
         while (curr != null)
         {
             var next = curr.Next;
-            if (curr.IsSynchronized)
+            if (curr.State != null && curr.IsSynchronized)
             {
                 if (prev == null) _giversHead = next;
                 else prev.Next = next;
@@ -122,6 +134,7 @@ public class Channel<T>
     public void PublishSend(SyncState state, int eventId, T value, Action resumePut)
     {
         Action<T>? getResume = null;
+        Action? directTakerResume = null;
         SyncState? getState = null;
         int getEventId = 0;
         bool matched = false;
@@ -135,9 +148,8 @@ public class Channel<T>
             {
                 var next = curr.Next;
 
-                if (curr.IsSynchronized)
+                if (curr.State != null && curr.IsSynchronized)
                 {
-                    // Clean stale receiver
                     if (prev == null) _takersHead = next;
                     else prev.Next = next;
 
@@ -148,9 +160,8 @@ public class Channel<T>
                     continue;
                 }
 
-                if (ReferenceEquals(curr.State, state))
+                if (curr.State != null && ReferenceEquals(curr.State, state))
                 {
-                    // Never pair a sync block with itself (self-choose)
                     prev = curr;
                     curr = next;
                     continue;
@@ -158,40 +169,54 @@ public class Channel<T>
 
                 if (state.TryClaim())
                 {
-                    if (curr.TrySync())
+                    if (curr.State != null)
                     {
-                        // Matched! Unlink curr
+                        if (curr.TrySync())
+                        {
+                            if (prev == null) _takersHead = next;
+                            else prev.Next = next;
+
+                            if (curr == _takersTail) _takersTail = prev;
+
+                            getResume = curr.ResumeGet;
+                            getState = curr.State;
+                            getEventId = curr.EventId;
+                            curr.Recycle();
+
+                            matched = true;
+                            break;
+                        }
+
+                        state.ResetClaim();
+                        if (curr.IsSynchronized)
+                        {
+                            if (prev == null) _takersHead = next;
+                            else prev.Next = next;
+
+                            if (curr == _takersTail) _takersTail = prev;
+
+                            curr.Recycle();
+                            curr = next;
+                            continue;
+                        }
+                    }
+                    else
+                    {
+                        // Direct taker
                         if (prev == null) _takersHead = next;
                         else prev.Next = next;
 
                         if (curr == _takersTail) _takersTail = prev;
 
-                        getResume = curr.ResumeGet;
-                        getState = curr.State;
-                        getEventId = curr.EventId;
-                        curr.Recycle();
+                        curr.DirectValue = value;
+                        directTakerResume = curr.DirectResume;
 
                         matched = true;
                         break;
                     }
-
-                    state.ResetClaim();
-                    // If the other receiver is now synchronized, unlink it
-                    if (curr.IsSynchronized)
-                    {
-                        if (prev == null) _takersHead = next;
-                        else prev.Next = next;
-
-                        if (curr == _takersTail) _takersTail = prev;
-
-                        curr.Recycle();
-                        curr = next;
-                        continue;
-                    }
                 }
                 else
                 {
-                    // We were fulfilled by someone else
                     return;
                 }
 
@@ -219,10 +244,17 @@ public class Channel<T>
 
         // Outside lock:
         state.MarkSynchronized(eventId);
-        getState!.MarkSynchronized(getEventId);
+        if (getState != null)
+        {
+            getState.MarkSynchronized(getEventId);
+            Scheduler.Dispatch(getResume!, value);
+        }
+        else if (directTakerResume != null)
+        {
+            Scheduler.Dispatch(directTakerResume);
+        }
 
         Scheduler.Dispatch(resumePut);
-        Scheduler.Dispatch(getResume!, value);
     }
 
     public void PublishReceive(SyncState state, int eventId, Action<T> resumeGet)
@@ -242,7 +274,7 @@ public class Channel<T>
             {
                 var next = curr.Next;
 
-                if (curr.IsSynchronized)
+                if (curr.State != null && curr.IsSynchronized)
                 {
                     if (prev == null) _giversHead = next;
                     else prev.Next = next;
@@ -254,7 +286,7 @@ public class Channel<T>
                     continue;
                 }
 
-                if (ReferenceEquals(curr.State, state))
+                if (curr.State != null && ReferenceEquals(curr.State, state))
                 {
                     prev = curr;
                     curr = next;
@@ -263,8 +295,41 @@ public class Channel<T>
 
                 if (state.TryClaim())
                 {
-                    if (curr.TrySync())
+                    if (curr.State != null)
                     {
+                        if (curr.TrySync())
+                        {
+                            if (prev == null) _giversHead = next;
+                            else prev.Next = next;
+
+                            if (curr == _giversTail) _giversTail = prev;
+
+                            putValue = curr.Value;
+                            putResume = curr.ResumePut;
+                            putState = curr.State;
+                            putEventId = curr.EventId;
+                            curr.Recycle();
+
+                            matched = true;
+                            break;
+                        }
+
+                        state.ResetClaim();
+                        if (curr.IsSynchronized)
+                        {
+                            if (prev == null) _giversHead = next;
+                            else prev.Next = next;
+
+                            if (curr == _giversTail) _giversTail = prev;
+
+                            curr.Recycle();
+                            curr = next;
+                            continue;
+                        }
+                    }
+                    else
+                    {
+                        // Direct giver
                         if (prev == null) _giversHead = next;
                         else prev.Next = next;
 
@@ -272,25 +337,9 @@ public class Channel<T>
 
                         putValue = curr.Value;
                         putResume = curr.ResumePut;
-                        putState = curr.State;
-                        putEventId = curr.EventId;
-                        curr.Recycle();
 
                         matched = true;
                         break;
-                    }
-
-                    state.ResetClaim();
-                    if (curr.IsSynchronized)
-                    {
-                        if (prev == null) _giversHead = next;
-                        else prev.Next = next;
-
-                        if (curr == _giversTail) _giversTail = prev;
-
-                        curr.Recycle();
-                        curr = next;
-                        continue;
                     }
                 }
                 else
@@ -322,9 +371,506 @@ public class Channel<T>
 
         // Outside lock:
         state.MarkSynchronized(eventId);
-        putState!.MarkSynchronized(putEventId);
+        if (putState != null) putState.MarkSynchronized(putEventId);
 
         Scheduler.Dispatch(putResume!);
         Scheduler.Dispatch(resumeGet, putValue);
     }
+
+    // -----------------------------------------------------------------------
+    // Direct Channel Operations (Non-Selective Fast Paths)
+    // -----------------------------------------------------------------------
+
+    public bool TryDirectReceive(out T value)
+    {
+        Action? putResume = null;
+        SyncState? putState = null;
+        int putEventId = 0;
+        value = default!;
+
+        lock (_lock)
+        {
+            PutOp<T>? prev = null;
+            PutOp<T>? curr = _giversHead;
+
+            while (curr != null)
+            {
+                var next = curr.Next;
+
+                if (curr.State != null && curr.IsSynchronized)
+                {
+                    if (prev == null) _giversHead = next;
+                    else prev.Next = next;
+
+                    if (curr == _giversTail) _giversTail = prev;
+
+                    curr.Recycle();
+                    curr = next;
+                    continue;
+                }
+
+                if (curr.State != null)
+                {
+                    if (curr.TrySync())
+                    {
+                        if (prev == null) _giversHead = next;
+                        else prev.Next = next;
+
+                        if (curr == _giversTail) _giversTail = prev;
+
+                        value = curr.Value;
+                        putResume = curr.ResumePut;
+                        putState = curr.State;
+                        putEventId = curr.EventId;
+                        curr.Recycle();
+                        break;
+                    }
+
+                    if (curr.IsSynchronized)
+                    {
+                        if (prev == null) _giversHead = next;
+                        else prev.Next = next;
+
+                        if (curr == _giversTail) _giversTail = prev;
+
+                        curr.Recycle();
+                        curr = next;
+                        continue;
+                    }
+                }
+                else
+                {
+                    // Direct giver
+                    if (prev == null) _giversHead = next;
+                    else prev.Next = next;
+
+                    if (curr == _giversTail) _giversTail = prev;
+
+                    value = curr.Value;
+                    putResume = curr.ResumePut;
+                    break;
+                }
+
+                prev = curr;
+                curr = next;
+            }
+        }
+
+        if (putResume != null)
+        {
+            if (putState != null) putState.MarkSynchronized(putEventId);
+            Scheduler.Dispatch(putResume);
+            return true;
+        }
+
+        return false;
+    }
+
+    public void ParkDirectReceive(GetOp<T> op)
+    {
+        Action? putResume = null;
+        SyncState? putState = null;
+        int putEventId = 0;
+        bool matched = false;
+        T val = default!;
+
+        lock (_lock)
+        {
+            PutOp<T>? prev = null;
+            PutOp<T>? curr = _giversHead;
+
+            while (curr != null)
+            {
+                var next = curr.Next;
+
+                if (curr.State != null && curr.IsSynchronized)
+                {
+                    if (prev == null) _giversHead = next;
+                    else prev.Next = next;
+
+                    if (curr == _giversTail) _giversTail = prev;
+
+                    curr.Recycle();
+                    curr = next;
+                    continue;
+                }
+
+                if (curr.State != null)
+                {
+                    if (curr.TrySync())
+                    {
+                        if (prev == null) _giversHead = next;
+                        else prev.Next = next;
+
+                        if (curr == _giversTail) _giversTail = prev;
+
+                        val = curr.Value;
+                        putResume = curr.ResumePut;
+                        putState = curr.State;
+                        putEventId = curr.EventId;
+                        curr.Recycle();
+
+                        matched = true;
+                        break;
+                    }
+
+                    if (curr.IsSynchronized)
+                    {
+                        if (prev == null) _giversHead = next;
+                        else prev.Next = next;
+
+                        if (curr == _giversTail) _giversTail = prev;
+
+                        curr.Recycle();
+                        curr = next;
+                        continue;
+                    }
+                }
+                else
+                {
+                    // Direct giver
+                    if (prev == null) _giversHead = next;
+                    else prev.Next = next;
+
+                    if (curr == _giversTail) _giversTail = prev;
+
+                    val = curr.Value;
+                    putResume = curr.ResumePut;
+
+                    matched = true;
+                    break;
+                }
+
+                prev = curr;
+                curr = next;
+            }
+
+            if (matched)
+            {
+                op.DirectValue = val;
+            }
+            else
+            {
+                if (_takersTail == null)
+                {
+                    _takersHead = _takersTail = op;
+                }
+                else
+                {
+                    _takersTail.Next = op;
+                    _takersTail = op;
+                }
+                return;
+            }
+        }
+
+        if (putState != null) putState.MarkSynchronized(putEventId);
+        Scheduler.Dispatch(putResume!);
+        Scheduler.Enqueue(op.DirectResume!);
+    }
+
+    public bool TryDirectSend(T value)
+    {
+        Action<T>? getResume = null;
+        Action? directResume = null;
+        SyncState? getState = null;
+        int getEventId = 0;
+
+        lock (_lock)
+        {
+            GetOp<T>? prev = null;
+            GetOp<T>? curr = _takersHead;
+
+            while (curr != null)
+            {
+                var next = curr.Next;
+
+                if (curr.State != null && curr.IsSynchronized)
+                {
+                    if (prev == null) _takersHead = next;
+                    else prev.Next = next;
+
+                    if (curr == _takersTail) _takersTail = prev;
+
+                    curr.Recycle();
+                    curr = next;
+                    continue;
+                }
+
+                if (curr.State != null)
+                {
+                    if (curr.TrySync())
+                    {
+                        if (prev == null) _takersHead = next;
+                        else prev.Next = next;
+
+                        if (curr == _takersTail) _takersTail = prev;
+
+                        getResume = curr.ResumeGet;
+                        getState = curr.State;
+                        getEventId = curr.EventId;
+                        curr.Recycle();
+                        break;
+                    }
+
+                    if (curr.IsSynchronized)
+                    {
+                        if (prev == null) _takersHead = next;
+                        else prev.Next = next;
+
+                        if (curr == _takersTail) _takersTail = prev;
+
+                        curr.Recycle();
+                        curr = next;
+                        continue;
+                    }
+                }
+                else
+                {
+                    // Direct taker
+                    if (prev == null) _takersHead = next;
+                    else prev.Next = next;
+
+                    if (curr == _takersTail) _takersTail = prev;
+
+                    curr.DirectValue = value;
+                    directResume = curr.DirectResume;
+                    break;
+                }
+
+                prev = curr;
+                curr = next;
+            }
+        }
+
+        if (getState != null)
+        {
+            getState.MarkSynchronized(getEventId);
+            Scheduler.Dispatch(getResume!, value);
+            return true;
+        }
+
+        if (directResume != null)
+        {
+            Scheduler.Dispatch(directResume);
+            return true;
+        }
+
+        return false;
+    }
+
+    public void ParkDirectSend(PutOp<T> op)
+    {
+        Action<T>? getResume = null;
+        Action? directResume = null;
+        SyncState? getState = null;
+        int getEventId = 0;
+        bool matched = false;
+
+        lock (_lock)
+        {
+            GetOp<T>? prev = null;
+            GetOp<T>? curr = _takersHead;
+
+            while (curr != null)
+            {
+                var next = curr.Next;
+
+                if (curr.State != null && curr.IsSynchronized)
+                {
+                    if (prev == null) _takersHead = next;
+                    else prev.Next = next;
+
+                    if (curr == _takersTail) _takersTail = prev;
+
+                    curr.Recycle();
+                    curr = next;
+                    continue;
+                }
+
+                if (curr.State != null)
+                {
+                    if (curr.TrySync())
+                    {
+                        if (prev == null) _takersHead = next;
+                        else prev.Next = next;
+
+                        if (curr == _takersTail) _takersTail = prev;
+
+                        getResume = curr.ResumeGet;
+                        getState = curr.State;
+                        getEventId = curr.EventId;
+                        curr.Recycle();
+
+                        matched = true;
+                        break;
+                    }
+
+                    if (curr.IsSynchronized)
+                    {
+                        if (prev == null) _takersHead = next;
+                        else prev.Next = next;
+
+                        if (curr == _takersTail) _takersTail = prev;
+
+                        curr.Recycle();
+                        curr = next;
+                        continue;
+                    }
+                }
+                else
+                {
+                    // Direct taker
+                    if (prev == null) _takersHead = next;
+                    else prev.Next = next;
+
+                    if (curr == _takersTail) _takersTail = prev;
+
+                    curr.DirectValue = op.Value;
+                    directResume = curr.DirectResume;
+                    matched = true;
+                    break;
+                }
+
+                prev = curr;
+                curr = next;
+            }
+
+            if (!matched)
+            {
+                if (_giversTail == null)
+                {
+                    _giversHead = _giversTail = op;
+                }
+                else
+                {
+                    _giversTail.Next = op;
+                    _giversTail = op;
+                }
+                return;
+            }
+        }
+
+        if (getState != null)
+        {
+            getState.MarkSynchronized(getEventId);
+            Scheduler.Dispatch(getResume!, op.Value);
+        }
+        else if (directResume != null)
+        {
+            Scheduler.Dispatch(directResume);
+        }
+
+        Scheduler.Enqueue(op.ResumePut);
+    }
+}
+
+public readonly struct ChannelReceiveAwaiter<T> : ICriticalNotifyCompletion
+{
+    private readonly Channel<T> _channel;
+    private readonly T _result;
+    private readonly bool _isCompleted;
+    private readonly GetOp<T>? _op;
+
+    public ChannelReceiveAwaiter(Channel<T> channel)
+    {
+        _channel = channel;
+        if (channel.TryDirectReceive(out _result))
+        {
+            _isCompleted = true;
+            _op = null;
+        }
+        else
+        {
+            _isCompleted = false;
+            _op = GetOp<T>.RentDirect();
+        }
+    }
+
+    public bool IsCompleted => _isCompleted;
+
+    public T GetResult()
+    {
+        if (_op != null)
+        {
+            var res = _op.DirectValue;
+            _op.Recycle();
+            return res;
+        }
+        return _result;
+    }
+
+    public void OnCompleted(Action continuation) => UnsafeOnCompleted(continuation);
+
+    public void UnsafeOnCompleted(Action continuation)
+    {
+        _op!.DirectResume = continuation;
+        _channel.ParkDirectReceive(_op);
+    }
+}
+
+public readonly struct ChannelSendAwaiter<T> : ICriticalNotifyCompletion
+{
+    private readonly Channel<T> _channel;
+    private readonly bool _isCompleted;
+    private readonly PutOp<T>? _op;
+
+    public ChannelSendAwaiter(Channel<T> channel, T value)
+    {
+        _channel = channel;
+        if (channel.TryDirectSend(value))
+        {
+            _isCompleted = true;
+            _op = null;
+        }
+        else
+        {
+            _isCompleted = false;
+            _op = PutOp<T>.Rent(null, 0, value, null!);
+        }
+    }
+
+    public bool IsCompleted => _isCompleted;
+
+    public void GetResult()
+    {
+        _op?.Recycle();
+    }
+
+    public void OnCompleted(Action continuation) => UnsafeOnCompleted(continuation);
+
+    public void UnsafeOnCompleted(Action continuation)
+    {
+        _op!.ResumePut = continuation;
+        _channel.ParkDirectSend(_op);
+    }
+}
+
+public readonly struct ChannelReceiveOperation<T> : IEvent<T>
+{
+    private readonly Channel<T> _channel;
+
+    public ChannelReceiveOperation(Channel<T> channel) => _channel = channel;
+
+    public ChannelReceiveAwaiter<T> GetAwaiter() => new(_channel);
+
+    public void Publish(SyncState state, int eventId, Action<T> onSync)
+        => _channel.PublishReceive(state, eventId, onSync);
+}
+
+public readonly struct ChannelSendOperation<T> : IEvent<Unit>
+{
+    private readonly Channel<T> _channel;
+    private readonly T _value;
+
+    public ChannelSendOperation(Channel<T> channel, T value)
+    {
+        _channel = channel;
+        _value = value;
+    }
+
+    public ChannelSendAwaiter<T> GetAwaiter() => new(_channel, _value);
+
+    public void Publish(SyncState state, int eventId, Action<Unit> onSync)
+        => _channel.PublishSend(state, eventId, _value, () => onSync(Unit.Value));
 }

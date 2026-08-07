@@ -21,12 +21,12 @@ namespace Bjoml;
 
 public abstract class Operation
 {
-    public SyncState State = null!;
+    public SyncState? State;
     public int EventId;
 
-    public bool IsSynchronized => State.IsSynchronized;
+    public bool IsSynchronized => State != null && State.IsSynchronized;
 
-    public bool TrySync() => State.TrySync();
+    public bool TrySync() => State != null && State.TrySync();
 }
 
 public sealed class PutOp<T> : Operation
@@ -39,7 +39,7 @@ public sealed class PutOp<T> : Operation
     public Action ResumePut = null!;
     public PutOp<T>? Next;
 
-    public static PutOp<T> Rent(SyncState state, int eventId, T value, Action resumePut)
+    public static PutOp<T> Rent(SyncState? state, int eventId, T value, Action resumePut)
     {
         var op = _free;
         if (op is null)
@@ -65,7 +65,7 @@ public sealed class PutOp<T> : Operation
 
     public void Recycle()
     {
-        State = null!;
+        State = null;
         Value = default!;
         ResumePut = null!;
         EventId = 0;
@@ -89,10 +89,12 @@ public sealed class GetOp<T> : Operation
     [ThreadStatic] private static GetOp<T>? _free;
     [ThreadStatic] private static int _freeCount;
 
-    public Action<T> ResumeGet = null!;
+    public Action<T>? ResumeGet;
+    public Action? DirectResume;
+    public T DirectValue = default!;
     public GetOp<T>? Next;
 
-    public static GetOp<T> Rent(SyncState state, int eventId, Action<T> resumeGet)
+    public static GetOp<T> Rent(SyncState? state, int eventId, Action<T>? resumeGet)
     {
         var op = _free;
         if (op is null)
@@ -111,13 +113,43 @@ public sealed class GetOp<T> : Operation
         op.State = state;
         op.EventId = eventId;
         op.ResumeGet = resumeGet;
+        op.DirectResume = null;
+        op.DirectValue = default!;
+        return op;
+    }
+
+    public static GetOp<T> RentDirect()
+    {
+        var op = _free;
+        if (op is null)
+        {
+            return new GetOp<T>
+            {
+                State = null,
+                EventId = 0,
+                ResumeGet = null,
+                DirectResume = null,
+                DirectValue = default!
+            };
+        }
+
+        _free = op.Next;
+        _freeCount--;
+        op.Next = null;
+        op.State = null;
+        op.EventId = 0;
+        op.ResumeGet = null;
+        op.DirectResume = null;
+        op.DirectValue = default!;
         return op;
     }
 
     public void Recycle()
     {
-        State = null!;
-        ResumeGet = null!;
+        State = null;
+        ResumeGet = null;
+        DirectResume = null;
+        DirectValue = default!;
         EventId = 0;
 
         if (_freeCount < MaxCached)

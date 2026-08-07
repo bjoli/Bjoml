@@ -87,7 +87,7 @@ internal interface IPromiseWaiter
 /// STARVATION WARNING: a completed promise inside a <c>choose</c> loop wins every
 /// iteration, exactly like <c>Cml.Always</c>. Document this for language users.
 /// </summary>
-public sealed class Promise<T>
+public sealed class Promise<T> : IEvent<Result<T>>
 {
     private const int Pending = 0;
     private const int Completed = 1;
@@ -200,8 +200,53 @@ public sealed class Promise<T>
 
     /// <summary>
     /// The joinable event. Carries failure as a value; unwrap it inside a fiber.
+    /// Returns this instance directly to avoid allocating event wrapper objects.
     /// </summary>
-    public IEvent<Result<T>> Join() => new PromiseEvent<T>(this);
+    public IEvent<Result<T>> Join() => this;
+
+    public void Publish(SyncState state, int eventId, Action<Result<T>> onSync)
+    {
+        if (IsCompleted)
+        {
+            Deliver(state, eventId, onSync);
+            return;
+        }
+
+        Register(new Waiter(this, state, eventId, onSync));
+    }
+
+    private void Deliver(SyncState state, int eventId, Action<Result<T>> onSync)
+    {
+        // TryCommit, not TryClaim. This waiter can run on a completely different
+        // thread long after Publish returned, and may well find the state transiently
+        // Claimed by a sibling branch still being published. Treating that as "someone
+        // else won" would drop a completion that actually happened, and the choose
+        // would then wait forever on an event that already fired.
+        if (!state.TryCommit(eventId)) return;
+
+        Scheduler.Dispatch(onSync, Outcome);
+    }
+
+    private sealed class Waiter : IPromiseWaiter
+    {
+        private readonly Promise<T> _owner;
+        private readonly SyncState _state;
+        private readonly int _eventId;
+        private readonly Action<Result<T>> _onSync;
+
+        public Waiter(Promise<T> owner, SyncState state, int eventId, Action<Result<T>> onSync)
+        {
+            _owner = owner;
+            _state = state;
+            _eventId = eventId;
+            _onSync = onSync;
+        }
+
+        public void Signal() => _owner.Deliver(_state, _eventId, _onSync);
+
+        /// <summary>Our sync block was won by another branch; we can be dropped.</summary>
+        public bool IsAbandoned => _state.IsSynchronized;
+    }
 
     // ---- direct-await surface (cheaper than routing through Cml.Sync) ------
 
@@ -223,54 +268,4 @@ public readonly struct PromiseAwaiter<T> : ICriticalNotifyCompletion
 
     // No ExecutionContext capture, by design. See FiberContext.
     public void UnsafeOnCompleted(Action continuation) => _p.OnCompleted(continuation);
-}
-
-internal sealed class PromiseEvent<T> : IEvent<Result<T>>
-{
-    private readonly Promise<T> _p;
-    public PromiseEvent(Promise<T> p) => _p = p;
-
-    public void Publish(SyncState state, int eventId, Action<Result<T>> onSync)
-    {
-        if (_p.IsCompleted)
-        {
-            Deliver(state, eventId, onSync);
-            return;
-        }
-
-        _p.Register(new Waiter(this, state, eventId, onSync));
-    }
-
-    private void Deliver(SyncState state, int eventId, Action<Result<T>> onSync)
-    {
-        // TryCommit, not TryClaim. This waiter can run on a completely different
-        // thread long after Publish returned, and may well find the state transiently
-        // Claimed by a sibling branch still being published. Treating that as "someone
-        // else won" would drop a completion that actually happened, and the choose
-        // would then wait forever on an event that already fired.
-        if (!state.TryCommit(eventId)) return;
-
-        Scheduler.Dispatch(onSync, _p.Outcome);
-    }
-
-    private sealed class Waiter : IPromiseWaiter
-    {
-        private readonly PromiseEvent<T> _owner;
-        private readonly SyncState _state;
-        private readonly int _eventId;
-        private readonly Action<Result<T>> _onSync;
-
-        public Waiter(PromiseEvent<T> owner, SyncState state, int eventId, Action<Result<T>> onSync)
-        {
-            _owner = owner;
-            _state = state;
-            _eventId = eventId;
-            _onSync = onSync;
-        }
-
-        public void Signal() => _owner.Deliver(_state, _eventId, _onSync);
-
-        /// <summary>Our sync block was won by another branch; we can be dropped.</summary>
-        public bool IsAbandoned => _state.IsSynchronized;
-    }
 }
