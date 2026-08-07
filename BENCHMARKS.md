@@ -491,6 +491,49 @@ a profiler, not more code reading.
 put every variant in the 91–97 band. Single invocations cannot resolve differences of
 this size, which is worth remembering before acting on any 5–10 ns "win".)
 
+### Can the JIT be told to optimise sooner? Yes, and it makes things worse
+
+The obvious response to a four-repetition warm-up is to force the optimising JIT
+earlier, either per method with
+`[MethodImpl(MethodImplOptions.AggressiveOptimization)]` or globally with
+`DOTNET_TieredCompilation=0`. Both were measured on `--mode select`, 12 repetitions:
+
+| configuration | rep 1 | steady state |
+|---|---|---|
+| default | 175 | **96–98** |
+| `TieredCompilation=0` | **95** | 118–124 |
+| `TieredPGO=0` | 174 | 110–111 |
+| `QuickJitForLoops=0` | 163 | 91–99 |
+| `AggressiveOptimization` on the hot channel methods | 172 | 93–95 |
+
+Two conclusions, both against the idea.
+
+**BjoML depends heavily on dynamic PGO — about 14%.** Turning it off costs 97 → 111
+ns/op. That is unsurprising in hindsight: the hot path is nothing but indirect calls —
+`IEvent<T>.Publish`, `Action<T>` continuations, `IThreadPoolWorkItem.Execute`,
+`IAsyncStateMachine.MoveNext` — and guarded devirtualisation from profile data is
+exactly what removes them. Disabling tiered compilation disables PGO with it, which is
+why it is 22% slower at steady state despite starting fast.
+
+Hopac behaves the same way (87 → 102 with `TieredPGO=0`, a 17% loss), so this is a
+property of CML-style runtimes on .NET rather than of BjoML specifically.
+
+**`AggressiveOptimization` did nothing measurable**, neither to warm-up nor to steady
+state, when applied to `PublishSend`, `PublishReceive`, `TryDirectSend` and
+`TryDirectReceive`. The hot path is spread across compiler-generated async state
+machines and generic instantiations that cannot be annotated, so annotating four
+hand-written methods covers too little of it to matter. It would also opt those
+methods out of PGO, which the table above shows is the expensive thing to lose.
+
+So: **do not** mark BjoML for aggressive optimisation and do not disable tiering. For
+benchmarking, use repetitions. If startup latency ever matters for the hosted
+language, ReadyToRun is the right tool — it starts above tier-0 quality *and* still
+tiers up with PGO — but that is untested here.
+
+A useful side effect: the BjoML/Hopac gap is stable across every configuration
+(10 ns default, 18 ns untiered, 9 ns without PGO), which confirms it is a real
+difference in the implementations and not a tiering artifact.
+
 ### Consequence for the rest of this document
 
 Every cross-runtime row above is single-shot and therefore carries the same warm-up
