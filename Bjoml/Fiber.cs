@@ -92,6 +92,12 @@ internal sealed class FiberStateMachineBox<TStateMachine> : IThreadPoolWorkItem
             // means the state machine itself failed, which must not kill the process.
             Scheduler.ReportUnhandled(ex);
         }
+        finally
+        {
+            // The fiber has run to its next suspension and this thread is about to
+            // go back to the pool, so publish anything it spawned along the way.
+            Scheduler.OnWorkItemComplete();
+        }
     }
 }
 
@@ -189,6 +195,7 @@ public sealed class FiberCore<T> : Promise<T>, IThreadPoolWorkItem
             _spawnState = null;
             CurrentSpawning = null;
             if (hasContextChange) FiberContext.Current = prev;
+            Scheduler.OnWorkItemComplete();
         }
     }
 }

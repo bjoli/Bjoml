@@ -130,3 +130,268 @@ Two conclusions:
   local queue is LIFO, so a bounced continuation is usually popped straight back by
   the same thread; the enqueue is not a thread migration in the common case.
 
+---
+
+# Spawn throughput vs Go
+
+Machine: AMD Ryzen 9 7900 (12C/24T), .NET 10.0.7 (ServerGC), Go 1.26.5, Linux 7.0.
+
+`bench/Bench` and `bench/go` are shaped identically: same counts, same topology,
+same work per unit. `bench/Diag` is the subtractive harness used to attribute cost.
+
+## The gap, as measured
+
+Medians of 3 runs, ns/op:
+
+| Benchmark | BjoML before | Go | note |
+|---|---|---|---|
+| Spawn storm | 321 | 201 | **the real gap, 1.6x** |
+| Ping-pong | 236 | 162 | |
+| Ring | 128 | 90 | |
+| Select/Choose | 214 | 134 | Go's `select`; not composable |
+| Fan-out | 113 ms | 120 ms | equal |
+| Spawn+send | 661 | 1778 | **not evidence, see below** |
+
+`Spawn+send` is 200 000 senders on ONE unbuffered channel. Go handles that
+particularly badly — every blocked sender allocates a `sudog`, links onto
+`hchan.sendq` under the channel mutex, and the receiver hands off to exactly one
+sender at a time. It is a lock convoy, not a rendezvous measurement, and it should
+not be read as a BjoML win.
+
+## Which cost dominates: GC or the queue?
+
+**The queue, overwhelmingly. GC is ~9%.**
+
+The decisive experiment is subtractive: run the same 1e6-unit workload with one
+ingredient removed at a time. All rows use one shared completion atomic, padded onto
+its own cache line, so the benchmark's own bookkeeping is constant across rows.
+Medians of 7 reps:
+
+| row | default GC | GC *entirely* disabled (`DOTNET_GCgen0size=0x20000000`) |
+|---|---|---|
+| `Parallel.For` chunked, no queue at all | 11 | 10 |
+| one pool work item per unit, **zero allocation** | 185 | 204 |
+| one pool work item per **32** units | 31 | 30 |
+| `Bjo.Spawn` | 216 | 196 |
+
+Three readings, and they all say the same thing:
+
+1. **GC is ~9%.** With gen0 raised to 512 MB the spawn storm does *zero* gen0
+   collections and reports `GCpause = 0.0 ms`, and `Bjo.Spawn` improves only
+   216 → 196 ns. The GC pause in the default configuration is ~12–38 ms out of
+   ~216 ms.
+2. **Allocation itself is ~free.** A pre-allocated, zero-allocation work item costs
+   the *same* 185 ns as one allocated per unit. The .NET allocator is a pointer bump;
+   80 bytes of gen0 garbage is not what is expensive.
+3. **How the queue operations are DISTRIBUTED is ~85% of the cost.** Same allocation,
+   same atomics, same work — batching 32 units per queue operation takes 185 → 31 ns.
+
+   Note carefully what this is *not* saying. The obvious reading is "fewer queue
+   operations = faster", and that reading is wrong: the batch rows above split all
+   the way down to leaves of ONE item, so they perform roughly the same number of
+   queue operations as the unbatched row, and they are still 6x faster. What changes
+   is *who* performs them. Unbatched, one thread pushes a million items into its own
+   local queue and 23 threads contend to steal them one at a time under the victim
+   queue's foreign lock. Batched, the tree spreads the pushes across every thread's
+   own local queue, where push/pop is uncontended and nearly free.
+
+   This distinction matters, because "fewer queue ops" motivates a coarse split floor
+   and that turns out to be actively harmful — see the parallelism sweep below.
+
+BjoML's own machinery is only ~30 ns of the 216 (`Bjo.Spawn` 216 vs raw pool 185).
+The fiber layer was never the problem.
+
+### Why the .NET pool costs ~185 ns per item here
+
+One producer, 24 consumers, a million tiny items. Every enqueue touches the pool's
+thread-request counter; every consumer steals **one item at a time** under the
+victim queue's foreign lock. The pool also over-injects threads on a deep backlog of
+tiny items — the harness observed 24 → 44 live worker threads on a 24-thread box.
+
+This is precisely where Go's scheduler differs, and it is not a micro-optimisation
+detail: Go moves runnable work in **batches** (a local runq spills 128 goroutines to
+the global queue at once; a steal takes *half* the victim's queue). .NET moves one
+work item per operation. Nothing about `preferLocal` changes this — `true` and
+`false` measured identically (185 vs 185).
+
+## The fix: batch the spawns, not the continuations
+
+`SpawnBatch` parks freshly spawned fibers in a thread-local buffer and hands the pool
+a *batch* work item every 64 fibers. `Scheduler.EnqueueSpawn` is deliberately
+separate from `Scheduler.Enqueue`: a rendezvous continuation wants to run on the
+thread that completed the match (locality, and there is only ever one of it), while a
+spawn has no locality to preserve and arrives in bursts.
+
+Three properties make it safe, and all three are load-bearing:
+
+- **Burst detection.** The first 8 spawns of a run go straight to the pool, so
+  "spawn a child and await it" is byte-for-byte the old path and cannot regress.
+- **Flush on yield.** Every work-item boundary flushes, so a fiber that suspends or
+  returns publishes whatever it queued.
+- **Watchdog.** A 1 ms timer flushes buffers whose owning thread has stopped
+  cooperating. This is *not* belt-and-braces: without it, a thread that spawns >8
+  fibers and then blocks on a non-BjoML primitive strands them **forever**. Deleting
+  the `EnsureWatchdog()` call turns 6 tests in `SpawnBatchTests` into hangs.
+
+The batch does not run inline as a block — that would trade queue cost for lost
+parallelism, which is bug B6 in a new hat.
+
+## Does the split policy have to be a fixed heuristic? No, and it must not be
+
+The first version of `SpawnBatchItem` split recursively down to a fixed floor of 8
+and ran the leaf inline, justified by "splitting to 1 would reintroduce the per-item
+queue cost". **That justification was wrong, and the constant was a 4.6x bug.**
+
+A fixed floor decides how much parallelism a batch can reach *before any thread has
+run*: a batch of N becomes ceil(N / floor) chunks and each chunk runs sequentially on
+one thread. With floor 8, sixteen CPU-bound fibers become two chunks — two-way
+parallelism on a 24-core box.
+
+The throughput harness cannot see this. With a million trivial fibers there is so
+much work that every policy fills every core. It only shows up when N is small but
+above the burst threshold and each fiber is expensive, which is why the original
+480-child fan-out benchmark missed it entirely, and why the original test — which
+asserted only that more than one thread was touched — passed while it was happening.
+
+`bench/Diag --mode fanout` sweeps N CPU-bound fibers against a calibrated serial
+reference and measures achieved speedup (ideal = `min(N, cores)`):
+
+| N | ideal | unbatched | floor=8 | floor=4 | floor=2 | floor=1 | adaptive |
+|---|---|---|---|---|---|---|---|
+| 12 | 12.0 | 14.9 | **6.8** | 7.0 | 7.5 | 10.9 | 13.0 |
+| 16 | 16.0 | 19.8 | **4.3** | 8.8 | 11.9 | 17.5 | 17.3 |
+| 20 | 20.0 | 19.7 | **6.9** | 11.1 | 14.6 | 20.5 | 20.0 |
+| 24 | 24.0 | 19.5 | **6.3** | 11.1 | 14.2 | 20.5 | 24.8 |
+| 48 | 24.0 | 25.6 | 14.6 | 18.5 | 22.3 | 22.6 | 21.9 |
+| 256 | 24.0 | 29.2 | 24.5 | 27.4 | 28.3 | 28.7 | 28.9 |
+
+And the throughput cross-check on 1e6 trivial fibers — the thing the floor was
+supposed to protect:
+
+| policy | ns/op | B/op | GC pause |
+|---|---|---|---|
+| unbatched | 289 | 80 | 5.6 ms |
+| tree floor=8 | 34 | 92 | 2.3 ms |
+| tree floor=2 | 33 | 104 | 0.9 ms |
+| tree floor=1 | 35 | 120 | 42.4 ms |
+| **adaptive** | **30** | **89** | **0.5 ms** |
+
+**Every batched policy has identical throughput.** The floor was protecting nothing
+and costing up to 4.6x in parallelism.
+
+`SpawnBatchMode.Adaptive` is therefore the default. It publishes the batch as one
+shared range drained by an atomic cursor: threads take chunks until it is empty, and
+a thread that finds work remaining recruits one more thread (capped at one per core,
+self-limiting once the cursor is exhausted). Chunk size follows guided
+self-scheduling — `remaining / (2 * workers)`, clamped — so it takes big bites while
+there is plenty left and small bites near the end, which is what stops the tail
+landing on a single thread. Achieved parallelism is then simply however many threads
+turned up: one thread drains it correctly, twenty-four split it twenty-four ways, and
+no constant had to predict which.
+
+It is also the cheapest policy on allocation (89 B/op) because it re-enqueues
+*itself* rather than allocating a new split item per level.
+
+Ranges handed out by the cursor are disjoint, so `RunRange` can null out array slots
+without synchronisation.
+
+The regression test is `"a batch of 16 CPU-bound fibers actually runs in parallel"`,
+which asserts achieved speedup rather than thread count, and fails at ~4.3x if the
+tree/floor=8 policy is restored.
+
+Note the adaptive chunk arithmetic is inert at the shipped capacity on a large box:
+`remaining / (2 * procs)` is `64 / 48 = 1` on 24 cores, so adaptive degenerates to a
+shared cursor handing out one fiber at a time. That is why it allocates least and
+performs best, but it also means the chunking logic is **not exercised by any of the
+numbers above**. On a 4-core machine the same expression gives 8, and chunks of 8
+reintroduce head-of-line blocking *within* a chunk: a claimed chunk cannot be taken
+by another thread, so a fiber that blocks its thread holds up its chunk-mates. That
+path is untested.
+
+## Watchdog fences
+
+The watchdog stops itself when a sweep finds nothing pending and re-arms on the next
+buffered spawn. That handshake is a store/load pair:
+
+```
+Add:   store _count = 1            ...  load  s_watchdogState
+Sweep: store s_watchdogState = 0   ...  load  _count
+```
+
+x86 permits StoreLoad reordering, and neither `Volatile.Write` (release) nor
+`Volatile.Read` (acquire) prevents it. With plain volatile accesses both sides can
+read stale values, both conclude the other party will handle it, and the buffered
+fibers are dropped — permanently, if the owning thread never spawns again. This is
+the deadlock the watchdog exists to prevent, reappearing inside the watchdog.
+
+Both sides therefore use a full fence: `Interlocked.CompareExchange` in
+`EnsureWatchdog` (which is why there is no `Volatile.Read` fast path in front of it)
+and `Interlocked.Exchange` in `Sweep`, followed by a re-scan after the stop is
+published. `Add` arms only on the empty-to-non-empty transition, so the fence is paid
+once per batch rather than once per spawn.
+
+**These fences are reasoned, not test-covered.** Removing the re-scan in `Sweep`
+still passes the stop/re-arm stress test three runs out of three; the window is a few
+instructions wide. Detecting it would need fault injection — a stall hook inside
+`Sweep` between the scan and the stop — which is not built.
+
+This is also why the earlier "do not build a trampoline" conclusion is *not*
+contradicted. That analysis was about rendezvous **continuations**, where the
+argument still holds: there is one continuation, it has locality worth keeping, and
+parking it is pure loss. Spawns have the opposite economics.
+
+## Result
+
+`bench/Diag`, medians of 7 reps:
+
+| | ns/op |
+|---|---|
+| `Bjo.Spawn` unbatched | 278 |
+| `Bjo.Spawn` batched | **37** |
+
+End-to-end, `bench/Bench` vs Go, medians of 3:
+
+| Benchmark | before | after | Go | vs Go |
+|---|---|---|---|---|
+| **Spawn storm** | 321 | **92** | 201 | **2.2x faster** |
+| Ping-pong | 236 | 206 | 162 | 1.3x slower |
+| Ring | 128 | 102 | 90 | 1.1x slower |
+| Select/Choose | 214 | 197 | 134 | 1.5x slower |
+| Fan-out | 113 ms | 118 ms | 120 ms | equal |
+
+Fan-out is unchanged (11.3x speedup on 12 physical cores), confirming the split
+preserves parallelism. Cost: +12 B/op (80 → 92) for the batch arrays and split items,
+and GC pause *drops* (12 ms → 0.4 ms) because fibers no longer pile up as an 80 MB
+live backlog waiting to be dequeued one at a time.
+
+## SimpleChannel: the like-for-like comparison against a Go `chan`
+
+`Channel<T>` is a composable CML event — it pays for `choose`, `withNack` and the
+`SyncState` protocol. A Go `chan` has no equivalent capability, so those rows flatter
+Go. `SimpleChannel` is the honest comparison: plain unbuffered point-to-point
+rendezvous, no composition.
+
+| Benchmark | `Channel<T>` | `SimpleChannel` | Go `chan` |
+|---|---|---|---|
+| Ping-pong | 206 | **178** | 162 |
+| Ring | 102 | 140 | 90 |
+| Spawn+send | 630 | **491** | 1778 |
+
+There is deliberately no `SimpleChannel` row for Select/Choose: a `SimpleChannel`
+cannot be an argument to `choose`. That is exactly the capability `Channel<T>` is
+charging ~60 ns for.
+
+`Ring simple` is the noisy one (69–144 ms across runs) and is *not* reliably faster
+than the CML ring; the ring is a single hot chain where the CML path's inline
+dispatch already avoids most scheduler traffic.
+
+## What is left on the table
+
+- **~30 ns of BjoML overhead per spawn** (216 vs 185 raw pool, pre-batching).
+  `FiberCore<T>` is 80 B and carries four fields (`_runner`, `_spawnBody`,
+  `_spawnState`, `_spawnInherited`) that are dead the moment the fiber starts.
+- **Ping-pong and Ring** are handoff-latency bound, not spawn bound. Batching does
+  nothing for them; they are already within 1.1–1.3x of Go.
+- **Select/Choose at 1.5x** is the widest remaining gap and is a `SyncState`
+  question (40 B/op allocated per sync), not a scheduler one.
+

@@ -32,6 +32,20 @@ public static class Program
         await Ring();
         await SelectChoose();
         await FanOut();
+
+        // SimpleChannel is the like-for-like comparison against a Go `chan`: both
+        // are plain unbuffered point-to-point rendezvous with no composition. The
+        // Channel<T> rows above are paying for `choose`/`withNack` machinery that
+        // Go has no equivalent of, so they flatter Go.
+        //
+        // There is deliberately no SimpleChannel row for Select/Choose: a
+        // SimpleChannel cannot be an argument to `choose`. That is exactly the
+        // capability the CML channel is charging for.
+        Console.WriteLine();
+        Console.WriteLine("--- SimpleChannel (non-composable, like a Go chan) ---");
+        await SpawnAndSendSimple();
+        await PingPongSimple();
+        await RingSimple();
     }
 
     static async Task Warmup()
@@ -314,6 +328,131 @@ public static class Program
         Console.WriteLine(
             $"Fan-out:          {numChildren} children in {sw.ElapsedMilliseconds} ms " +
             $"(serial reference {serialTotalMs:F0} ms, speedup {serialTotalMs / sw.Elapsed.TotalMilliseconds:F1}x)");
+    }
+
+    // ---------------------------------------------------------------------
+
+    // ---------------------------------------------------------------------
+    // SimpleChannel counterparts
+    // ---------------------------------------------------------------------
+
+    static async Fiber SendOneSimple(SimpleChannel<int> ch, int v) => await ch.PutMessage(v);
+
+    static async Task SpawnAndSendSimple()
+    {
+        const int n = 200_000;
+        var ch = new SimpleChannel<int>();
+
+        long before = GC.GetTotalAllocatedBytes(precise: true);
+        var sw = Stopwatch.StartNew();
+
+        for (int i = 0; i < n; i++)
+        {
+            int v = i;
+            Bjo.Spawn(static s => SendOneSimple(s.ch, s.v), (ch, v));
+        }
+
+        long total = 0;
+        for (int i = 0; i < n; i++) total += await ch.GetMessage();
+
+        sw.Stop();
+        long alloc = GC.GetTotalAllocatedBytes(precise: true) - before;
+
+        Report("Spawn+send simple", n, sw, alloc, $"total={total}");
+    }
+
+    static async Fiber PongerSimple(SimpleChannel<int> a, SimpleChannel<int> b, int rounds)
+    {
+        for (int i = 0; i < rounds; i++)
+        {
+            int v = await a.GetMessage();
+            await b.PutMessage(v * 2);
+        }
+    }
+
+    static async Fiber PingerSimple(SimpleChannel<int> a, SimpleChannel<int> b, int rounds)
+    {
+        for (int i = 0; i < rounds; i++)
+        {
+            await a.PutMessage(i);
+            await b.GetMessage();
+        }
+    }
+
+    static async Task PingPongSimple()
+    {
+        const int rounds = 1_000_000;
+        var a = new SimpleChannel<int>();
+        var b = new SimpleChannel<int>();
+
+        var pong = Bjo.Spawn(() => PongerSimple(a, b, rounds));
+
+        long before = GC.GetTotalAllocatedBytes(precise: true);
+        var sw = Stopwatch.StartNew();
+
+        var ping = Bjo.Spawn(() => PingerSimple(a, b, rounds));
+        await pong.ToTask();
+        await ping.ToTask();
+
+        sw.Stop();
+        long alloc = GC.GetTotalAllocatedBytes(precise: true) - before;
+
+        Report("Ping-pong simple", rounds, sw, alloc, "round trips");
+    }
+
+    static async Fiber RingNodeSimple(SimpleChannel<int> inCh, SimpleChannel<int> outCh, bool isLast, int numTrips)
+    {
+        while (true)
+        {
+            int msg = await inCh.GetMessage();
+
+            if (msg == -1)
+            {
+                if (!isLast) await outCh.PutMessage(-1);
+                return;
+            }
+
+            if (isLast)
+            {
+                msg++;
+                if (msg >= numTrips)
+                {
+                    await outCh.PutMessage(-1);
+                    continue;
+                }
+            }
+
+            await outCh.PutMessage(msg);
+        }
+    }
+
+    static async Task RingSimple()
+    {
+        const int numWorkers = 1000;
+        const int numTrips = 1000;
+
+        var channels = new SimpleChannel<int>[numWorkers];
+        for (int i = 0; i < numWorkers; i++) channels[i] = new SimpleChannel<int>();
+
+        var handles = new Promise<Unit>[numWorkers];
+        for (int i = 0; i < numWorkers; i++)
+        {
+            var inCh = channels[i];
+            var outCh = channels[(i + 1) % numWorkers];
+            bool isLast = i == numWorkers - 1;
+            handles[i] = Bjo.Spawn(() => RingNodeSimple(inCh, outCh, isLast, numTrips));
+        }
+
+        long before = GC.GetTotalAllocatedBytes(precise: true);
+        var sw = Stopwatch.StartNew();
+
+        await channels[0].PutMessage(0);
+        foreach (var h in handles) await h.ToTask();
+
+        sw.Stop();
+        long alloc = GC.GetTotalAllocatedBytes(precise: true) - before;
+
+        Report("Ring simple", numWorkers * numTrips, sw, alloc, "messages");
     }
 
     // ---------------------------------------------------------------------

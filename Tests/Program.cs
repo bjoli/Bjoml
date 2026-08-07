@@ -15,6 +15,7 @@ public static class Program
 
         CmlTests.RunAll();
         FiberTests.RunAll();
+        SpawnBatchTests.RunAll();
 
         return Harness.Report();
     }

@@ -97,6 +97,99 @@ public static class Scheduler
     public static void Enqueue<T>(Action<T> work, T state)
         => ThreadPool.UnsafeQueueUserWorkItem(ActionWorkItem<T>.Rent(work, state), preferLocal: true);
 
+    // ---- spawn -------------------------------------------------------------
+
+    /// <summary>
+    /// Set false to bypass <see cref="SpawnBatch"/> entirely and give every spawn
+    /// its own queue operation, as before. Kept so the batching can be A/B'd
+    /// against the old path without rebuilding.
+    /// </summary>
+    public static bool BatchSpawns { get; set; } = true;
+
+    /// <summary>How a published batch is spread over worker threads.</summary>
+    public enum SpawnBatchMode
+    {
+        /// <summary>
+        /// Recursive halving: each batch hands half its range back to the pool until
+        /// the range reaches <see cref="SpawnSplitFloor"/>. Cheap and stealable, but
+        /// the parallelism it can reach is fixed by the floor before any thread runs.
+        /// </summary>
+        Tree,
+
+        /// <summary>
+        /// One shared range drained by an atomic cursor, with threads recruiting more
+        /// threads while work remains. Parallelism is decided at run time by how many
+        /// workers actually turn up, not by a constant.
+        /// </summary>
+        Adaptive,
+    }
+
+    /// <summary>
+    /// Defaults to <see cref="SpawnBatchMode.Adaptive"/>, on measurement rather than
+    /// taste. Sweeping N CPU-bound fibers (bench/Diag <c>--mode fanout</c>) against a
+    /// serial reference, and 1e6 trivial fibers for throughput:
+    ///
+    /// <code>
+    ///                 speedup at N=16   speedup at N=24   throughput   B/op
+    ///   unbatched         19.8              19.5            289 ns      80
+    ///   tree floor=8       4.3               6.3             34 ns      92
+    ///   tree floor=2      11.9              14.2             33 ns     104
+    ///   tree floor=1      17.5              20.5             35 ns     120
+    ///   adaptive          17.3              24.8             30 ns      89
+    /// </code>
+    ///
+    /// Every batched policy has the same throughput, so the fixed floor was buying
+    /// nothing and costing up to 4.6x in parallelism. Adaptive is best on all four
+    /// columns: it allocates no split items (it re-enqueues itself) and it is the
+    /// only policy whose parallelism is not decided before any thread has run.
+    /// </summary>
+    public static SpawnBatchMode BatchMode { get; set; } = SpawnBatchMode.Adaptive;
+
+    /// <summary>
+    /// Smallest range <see cref="SpawnBatchMode.Tree"/> will still split. Only
+    /// consulted in <see cref="SpawnBatchMode.Tree"/> mode, which is no longer the
+    /// default; kept so the comparison in <see cref="BatchMode"/> stays reproducible.
+    ///
+    /// Beware: this constant decides how much parallelism a batch can reach BEFORE
+    /// any thread has run. A batch of N fibers becomes ceil(N / floor) chunks and
+    /// each chunk runs SEQUENTIALLY on one thread, so a floor of 8 caps a 16-fiber
+    /// fan-out at two-way parallelism no matter how many cores are idle. That is
+    /// precisely the bug that motivated the adaptive mode.
+    /// </summary>
+    public static int SpawnSplitFloor { get; set; } = 1;
+
+    /// <summary>
+    /// Queue a newly spawned fiber.
+    ///
+    /// Distinct from <see cref="Enqueue(IThreadPoolWorkItem)"/> on purpose: a spawn
+    /// and a rendezvous continuation want opposite things. A continuation wants to
+    /// run on the thread that just completed the match, for cache locality, and
+    /// there is exactly one of it. A spawn is "go run this somewhere else", it has
+    /// no locality to preserve, and spawns arrive in bursts — which is precisely
+    /// the shape that can be batched. See <see cref="SpawnBatch"/> for the numbers.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void EnqueueSpawn(IThreadPoolWorkItem item)
+    {
+        if (!BatchSpawns) { ThreadPool.UnsafeQueueUserWorkItem(item, preferLocal: true); return; }
+        SpawnBatch.Current.Add(item);
+    }
+
+    /// <summary>
+    /// Called at every work-item boundary — i.e. every point where this thread is
+    /// about to go back to the pool and could block or idle. Publishes anything the
+    /// fiber spawned but that batching has not handed over yet.
+    ///
+    /// This is what keeps batched spawns from being stranded on a thread that stops
+    /// making progress; see the hazard note on <see cref="SpawnBatch"/>.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static void OnWorkItemComplete()
+    {
+        if (!BatchSpawns) return;
+        SpawnBatch.Current.FlushAndEndRun();
+    }
+
     // ---- dispatch ----------------------------------------------------------
 
     /// <summary>
@@ -199,6 +292,10 @@ internal sealed class ActionWorkItem : IThreadPoolWorkItem
         {
             Scheduler.ReportUnhandled(ex);
         }
+        finally
+        {
+            Scheduler.OnWorkItemComplete();
+        }
     }
 }
 
@@ -252,6 +349,10 @@ internal sealed class ActionWorkItem<T> : IThreadPoolWorkItem
         catch (Exception ex)
         {
             Scheduler.ReportUnhandled(ex);
+        }
+        finally
+        {
+            Scheduler.OnWorkItemComplete();
         }
     }
 }

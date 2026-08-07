@@ -47,7 +47,7 @@ public static class Bjo
     {
         var inherited = FiberContext.Current;
         var core = new FiberCore<T>(SpawnRunners<T>.FuncRunner, body, null, inherited);
-        Scheduler.Enqueue(core);
+        Scheduler.EnqueueSpawn(core);
         return core;
     }
 
@@ -58,7 +58,7 @@ public static class Bjo
     {
         var inherited = FiberContext.Current;
         var core = new FiberCore<TResult>(SpawnStateRunners<TState, TResult>.StateRunner, body, state, inherited);
-        Scheduler.Enqueue(core);
+        Scheduler.EnqueueSpawn(core);
         return core;
     }
 
@@ -67,7 +67,7 @@ public static class Bjo
     {
         var inherited = FiberContext.Current;
         var core = new FiberCore<Unit>(SpawnUnitRunners.FuncRunner, body, null, inherited);
-        Scheduler.Enqueue(core);
+        Scheduler.EnqueueSpawn(core);
         return core;
     }
 
@@ -78,7 +78,7 @@ public static class Bjo
     {
         var inherited = FiberContext.Current;
         var core = new FiberCore<Unit>(SpawnStateRunners<TState, Unit>.UnitStateRunner, body, state, inherited);
-        Scheduler.Enqueue(core);
+        Scheduler.EnqueueSpawn(core);
         return core;
     }
 
