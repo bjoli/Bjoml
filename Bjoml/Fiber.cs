@@ -102,6 +102,20 @@ internal sealed class FiberStateMachineBox<TStateMachine> : IThreadPoolWorkItem
 
 public sealed class FiberCore<T> : Promise<T>
 {
+    [ThreadStatic] internal static FiberCore<T>? CurrentSpawning;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static FiberCore<T>? TakeSpawning()
+    {
+        var item = CurrentSpawning;
+        if (item is not null)
+        {
+            CurrentSpawning = null;
+            return item;
+        }
+        return null;
+    }
+
     private object? _box;
 
     public void SetResult(T value) => TrySetResult(value);
@@ -182,7 +196,7 @@ public struct FiberMethodBuilder<T>
     public static FiberMethodBuilder<T> Create()
     {
         var b = default(FiberMethodBuilder<T>);
-        b._core = new FiberCore<T>();
+        b._core = FiberCore<T>.TakeSpawning() ?? new FiberCore<T>();
         return b;
     }
 
@@ -227,7 +241,7 @@ public struct FiberMethodBuilder
     public static FiberMethodBuilder Create()
     {
         var b = default(FiberMethodBuilder);
-        b._core = new FiberCore<Unit>();
+        b._core = FiberCore<Unit>.TakeSpawning() ?? new FiberCore<Unit>();
         return b;
     }
 

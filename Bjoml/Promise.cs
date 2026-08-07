@@ -205,12 +205,38 @@ public class Promise<T> : IEvent<Result<T>>
 
     /// <summary>Pipe this promise's outcome into <paramref name="target"/> when it lands.</summary>
     internal void Forward(Promise<T> target)
-        => OnCompleted(() =>
+    {
+        if (IsCompleted)
         {
             var r = Outcome;
             if (r.IsError) target.TrySetException(r.Error!);
             else target.TrySetResult(r.Value);
-        });
+            return;
+        }
+
+        Register(new ForwardWaiter(this, target));
+    }
+
+    private sealed class ForwardWaiter : IPromiseWaiter
+    {
+        private readonly Promise<T> _source;
+        private readonly Promise<T> _target;
+
+        public ForwardWaiter(Promise<T> source, Promise<T> target)
+        {
+            _source = source;
+            _target = target;
+        }
+
+        public void Signal()
+        {
+            var r = _source.Outcome;
+            if (r.IsError) _target.TrySetException(r.Error!);
+            else _target.TrySetResult(r.Value);
+        }
+
+        public bool IsAbandoned => _target.IsCompleted;
+    }
 
     // ---- CML surface -------------------------------------------------------
 

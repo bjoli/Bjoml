@@ -46,7 +46,7 @@ public static class Bjo
     public static Promise<T> Spawn<T>(Func<Fiber<T>> body)
     {
         var inherited = FiberContext.Current;
-        var handle = new Promise<T>();
+        var handle = new FiberCore<T>();
         Scheduler.Enqueue(SpawnWorkItem<T>.Rent(body, inherited, handle));
         return handle;
     }
@@ -55,7 +55,7 @@ public static class Bjo
     public static Promise<Unit> Spawn(Func<Fiber> body)
     {
         var inherited = FiberContext.Current;
-        var handle = new Promise<Unit>();
+        var handle = new FiberCore<Unit>();
         Scheduler.Enqueue(SpawnWorkItem.Rent(body, inherited, handle));
         return handle;
     }
@@ -121,9 +121,9 @@ internal sealed class SpawnWorkItem<T> : IThreadPoolWorkItem
     private SpawnWorkItem<T>? _next;
     private Func<Fiber<T>> _body = null!;
     private object? _inherited;
-    private Promise<T> _handle = null!;
+    private FiberCore<T> _handle = null!;
 
-    public static SpawnWorkItem<T> Rent(Func<Fiber<T>> body, object? inherited, Promise<T> handle)
+    public static SpawnWorkItem<T> Rent(Func<Fiber<T>> body, object? inherited, FiberCore<T> handle)
     {
         var item = _free;
         if (item is null)
@@ -164,9 +164,14 @@ internal sealed class SpawnWorkItem<T> : IThreadPoolWorkItem
 
         var prev = FiberContext.Current;
         FiberContext.Current = inherited;
+        FiberCore<T>.CurrentSpawning = handle;
         try
         {
-            body().AsPromise().Forward(handle);
+            var fiber = body();
+            if (!ReferenceEquals(fiber.Core, handle))
+            {
+                fiber.AsPromise().Forward(handle);
+            }
         }
         catch (Exception e)
         {
@@ -174,6 +179,7 @@ internal sealed class SpawnWorkItem<T> : IThreadPoolWorkItem
         }
         finally
         {
+            FiberCore<T>.CurrentSpawning = null;
             FiberContext.Current = prev;
         }
     }
@@ -188,9 +194,9 @@ internal sealed class SpawnWorkItem : IThreadPoolWorkItem
     private SpawnWorkItem? _next;
     private Func<Fiber> _body = null!;
     private object? _inherited;
-    private Promise<Unit> _handle = null!;
+    private FiberCore<Unit> _handle = null!;
 
-    public static SpawnWorkItem Rent(Func<Fiber> body, object? inherited, Promise<Unit> handle)
+    public static SpawnWorkItem Rent(Func<Fiber> body, object? inherited, FiberCore<Unit> handle)
     {
         var item = _free;
         if (item is null)
@@ -231,9 +237,14 @@ internal sealed class SpawnWorkItem : IThreadPoolWorkItem
 
         var prev = FiberContext.Current;
         FiberContext.Current = inherited;
+        FiberCore<Unit>.CurrentSpawning = handle;
         try
         {
-            body().AsPromise().Forward(handle);
+            var fiber = body();
+            if (!ReferenceEquals(fiber.Core, handle))
+            {
+                fiber.AsPromise().Forward(handle);
+            }
         }
         catch (Exception e)
         {
@@ -241,6 +252,7 @@ internal sealed class SpawnWorkItem : IThreadPoolWorkItem
         }
         finally
         {
+            FiberCore<Unit>.CurrentSpawning = null;
             FiberContext.Current = prev;
         }
     }
