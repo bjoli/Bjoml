@@ -1,0 +1,201 @@
+// Reference implementation of the BjoML spawn/channel benchmarks in Go.
+//
+// The point of comparison is goroutines vs fibers, so every benchmark here is
+// shaped identically to its C# counterpart in ../Bench: same counts, same
+// channel topology, same amount of work per unit.
+//
+// All channels are unbuffered, which is the rendezvous semantics BjoML gives.
+
+package main
+
+import (
+	"fmt"
+	"runtime"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+func main() {
+	fmt.Printf("Go %s, GOMAXPROCS=%d\n\n", runtime.Version(), runtime.GOMAXPROCS(0))
+
+	spawnStorm()
+	spawnAndSend()
+	pingPong()
+	ring()
+	fanOut()
+}
+
+// 1. Spawn storm: N goroutines that do nothing but bump a counter and exit.
+//    Measures raw spawn + join cost with no communication at all.
+func spawnStorm() {
+	const n = 1_000_000
+
+	var wg sync.WaitGroup
+	var counter int64
+
+	start := time.Now()
+
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			atomic.AddInt64(&counter, 1)
+			wg.Done()
+		}()
+	}
+	wg.Wait()
+
+	elapsed := time.Since(start)
+	fmt.Printf("Spawn storm:      %d goroutines in %v (%.0f ns/spawn), counter=%d\n",
+		n, elapsed.Round(time.Millisecond), float64(elapsed.Nanoseconds())/float64(n), counter)
+}
+
+// 2. Spawn + one channel send each: N goroutines each send one value to a shared
+//    unbuffered channel; the main goroutine receives N of them.
+//    Measures spawn cost plus one rendezvous per spawn.
+func spawnAndSend() {
+	const n = 200_000
+
+	ch := make(chan int)
+
+	start := time.Now()
+
+	for i := 0; i < n; i++ {
+		go func(v int) { ch <- v }(i)
+	}
+
+	total := 0
+	for i := 0; i < n; i++ {
+		total += <-ch
+	}
+
+	elapsed := time.Since(start)
+	fmt.Printf("Spawn+send:       %d goroutines in %v (%.0f ns/op), total=%d\n",
+		n, elapsed.Round(time.Millisecond), float64(elapsed.Nanoseconds())/float64(n), total)
+}
+
+// 3. Ping-pong: two goroutines bouncing a value over two unbuffered channels.
+//    Measures pure handoff latency with no spawning in the loop.
+func pingPong() {
+	const rounds = 1_000_000
+
+	a := make(chan int)
+	b := make(chan int)
+	done := make(chan struct{})
+
+	go func() {
+		for i := 0; i < rounds; i++ {
+			v := <-a
+			b <- v * 2
+		}
+		close(done)
+	}()
+
+	start := time.Now()
+
+	go func() {
+		for i := 0; i < rounds; i++ {
+			a <- i
+			<-b
+		}
+	}()
+
+	<-done
+	elapsed := time.Since(start)
+
+	fmt.Printf("Ping-pong:        %d round trips in %v (%.0f ns/round-trip)\n",
+		rounds, elapsed.Round(time.Millisecond), float64(elapsed.Nanoseconds())/float64(rounds))
+}
+
+// 4. Ring: 1000 goroutines in a circle, a token going round 1000 times.
+//    Same shape as the BjoML ring benchmark.
+func ring() {
+	const numWorkers = 1000
+	const numTrips = 1000
+
+	channels := make([]chan int, numWorkers)
+	for i := range channels {
+		channels[i] = make(chan int)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(numWorkers)
+
+	for i := 0; i < numWorkers; i++ {
+		workerID := i
+		in := channels[workerID]
+		out := channels[(workerID+1)%numWorkers]
+		isLast := workerID == numWorkers-1
+
+		go func() {
+			defer wg.Done()
+			for {
+				msg := <-in
+				if msg == -1 {
+					if !isLast {
+						out <- -1
+					}
+					return
+				}
+				if isLast {
+					msg++
+					if msg >= numTrips {
+						out <- -1
+						continue
+					}
+				}
+				out <- msg
+			}
+		}()
+	}
+
+	start := time.Now()
+	channels[0] <- 0
+	wg.Wait()
+	elapsed := time.Since(start)
+
+	fmt.Printf("Ring:             %d messages in %v (%.0f ns/message)\n",
+		numWorkers*numTrips, elapsed.Round(time.Millisecond),
+		float64(elapsed.Nanoseconds())/float64(numWorkers*numTrips))
+}
+
+// 5. Fan-out: one goroutine spawns N children each doing a fixed slab of CPU work.
+//    Measures whether the scheduler spreads children across cores.
+func fanOut() {
+	const numChildren = 480
+	const iterations = 3_000_000
+
+	// Serial reference, so the speedup is measured rather than assumed.
+	serialStart := time.Now()
+	burn(iterations)
+	serialTotal := time.Since(serialStart) * numChildren
+
+	var wg sync.WaitGroup
+	wg.Add(numChildren)
+
+	start := time.Now()
+	go func() {
+		for i := 0; i < numChildren; i++ {
+			go func() {
+				defer wg.Done()
+				burn(iterations)
+			}()
+		}
+	}()
+	wg.Wait()
+	elapsed := time.Since(start)
+
+	fmt.Printf("Fan-out:          %d children in %v (serial reference %v, speedup %.1fx)\n",
+		numChildren, elapsed.Round(time.Millisecond), serialTotal.Round(time.Millisecond),
+		float64(serialTotal)/float64(elapsed))
+}
+
+var sink float64
+
+func burn(iterations int) {
+	acc := 0.0
+	for i := 1; i <= iterations; i++ {
+		acc += 1.0 / float64(i)
+	}
+	sink = acc
+}
