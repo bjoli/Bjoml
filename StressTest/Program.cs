@@ -41,6 +41,8 @@ class Program
         Console.WriteLine();
         await RunFiberRingBenchmark();
         Console.WriteLine();
+        await RunFiberSimpleRingBenchmark();
+        Console.WriteLine();
         await RunFanOutBenchmark();
         Console.WriteLine();
         await RunCombinatorTest();
@@ -338,6 +340,64 @@ class Program
             }
 
             await outChannel.Send(msg);
+        }
+    }
+
+    static async Task RunFiberSimpleRingBenchmark()
+    {
+        const int numWorkers = 1000;
+        const int numTrips = 1000;
+
+        Console.WriteLine($"--- Fiber SimpleChannel Ring Benchmark: {numWorkers} workers, {numTrips} trips around the ring ---");
+
+        var channels = new SimpleChannel<int>[numWorkers];
+        for (int i = 0; i < numWorkers; i++) channels[i] = new SimpleChannel<int>();
+
+        var handles = new Promise<Unit>[numWorkers];
+
+        for (int i = 0; i < numWorkers; i++)
+        {
+            int workerId = i;
+            var inChannel = channels[workerId];
+            var outChannel = channels[(workerId + 1) % numWorkers];
+            bool isLast = workerId == numWorkers - 1;
+
+            handles[i] = Bjo.Spawn(() => SimpleRingNode(inChannel, outChannel, isLast, numTrips));
+        }
+
+        var sw = Stopwatch.StartNew();
+
+        await channels[0].PutMessage(0);
+
+        foreach (var h in handles) await h.ToTask();
+
+        sw.Stop();
+        Console.WriteLine($"Fiber SimpleChannel Ring Benchmark finished in {sw.ElapsedMilliseconds} ms. Passed {numWorkers * numTrips} messages.");
+    }
+
+    static async Fiber SimpleRingNode(SimpleChannel<int> inChannel, SimpleChannel<int> outChannel, bool isLast, int numTrips)
+    {
+        while (true)
+        {
+            int msg = await inChannel.GetMessage();
+
+            if (msg == -1)
+            {
+                if (!isLast) await outChannel.PutMessage(-1);
+                return;
+            }
+
+            if (isLast)
+            {
+                msg++;
+                if (msg >= numTrips)
+                {
+                    await outChannel.PutMessage(-1);
+                    continue;
+                }
+            }
+
+            await outChannel.PutMessage(msg);
         }
     }
 

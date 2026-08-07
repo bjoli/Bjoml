@@ -8,61 +8,198 @@
 // (at your option) any later version.
 
 using System;
-using System.Collections.Generic;
-using System.Threading.Tasks;
+using System.Runtime.CompilerServices;
 
 namespace Bjoml;
 
-public class SimpleChannel<T>
+/// <summary>
+/// A high-performance, point-to-point unbuffered rendezvous channel.
+///
+/// Unlike <see cref="Channel{T}"/>, this is NOT a composable CML event (it cannot be
+/// passed to <c>choose</c> or <c>withNack</c>). Instead, it provides raw, direct
+/// fiber-to-fiber (and task-to-task) rendezvous with zero GC allocations and direct
+/// inline continuation resumption.
+/// </summary>
+public sealed class SimpleChannel<T>
 {
-    private readonly Queue<(T Value, Action ResumePut)> _puts = new();
-    private readonly Queue<Action<T>> _gets = new();
     private readonly object _lock = new();
+    private SimpleNode<T>? _putsHead, _putsTail;
+    private SimpleNode<T>? _getsHead, _getsTail;
 
-    public ValueTask PutMessage(T value)
+    public SimpleAwaitable<T> PutMessage(T value)
     {
-        Action<T>? getResume = null;
-        
+        Action? toResume = null;
+        SimpleNode<T>? node = null;
+
         lock (_lock)
         {
-            if (_gets.Count > 0)
+            if (_getsHead is not null)
             {
-                getResume = _gets.Dequeue();
+                var getter = _getsHead;
+                _getsHead = getter.Next;
+                if (_getsHead is null) _getsTail = null;
+
+                getter.Value = value;
+                getter.IsCompleted = true;
+                toResume = getter.Continuation;
             }
             else
             {
-                var source = CmlValueTaskSource<Unit>.Rent();
-                _puts.Enqueue((value, source.OnSyncVoidDelegate));
-                return new ValueTask(source, source.Version);
+                node = SimpleNode<T>.Rent();
+                node.Value = value;
+                node.Channel = this;
+                node.IsPut = true;
+                if (_putsTail is null) _putsHead = _putsTail = node;
+                else { _putsTail.Next = node; _putsTail = node; }
             }
         }
 
-        Scheduler.Dispatch(getResume, value);
-        return default;
+        if (toResume is not null) Scheduler.Dispatch(toResume);
+        return node is null ? SimpleAwaitable<T>.Completed(default) : SimpleAwaitable<T>.Pending(node);
     }
 
-    public ValueTask<T> GetMessage()
+    public SimpleAwaitable<T> GetMessage()
     {
-        Action? putResume = null;
-        T? value = default;
+        Action? toResume = null;
+        SimpleNode<T>? node = null;
+        T? syncVal = default;
+        bool isSync = false;
 
         lock (_lock)
         {
-            if (_puts.Count > 0)
+            if (_putsHead is not null)
             {
-                var put = _puts.Dequeue();
-                value = put.Value;
-                putResume = put.ResumePut;
+                var putter = _putsHead;
+                _putsHead = putter.Next;
+                if (_putsHead is null) _putsTail = null;
+
+                syncVal = putter.Value!;
+                putter.IsCompleted = true;
+                toResume = putter.Continuation;
+                isSync = true;
             }
             else
             {
-                var source = CmlValueTaskSource<T>.Rent();
-                _gets.Enqueue(source.OnSyncDelegate);
-                return new ValueTask<T>(source, source.Version);
+                node = SimpleNode<T>.Rent();
+                node.Channel = this;
+                node.IsPut = false;
+                if (_getsTail is null) _getsHead = _getsTail = node;
+                else { _getsTail.Next = node; _getsTail = node; }
             }
         }
 
-        Scheduler.Dispatch(putResume);
-        return new ValueTask<T>(value!);
+        if (toResume is not null) Scheduler.Dispatch(toResume);
+        return isSync ? SimpleAwaitable<T>.Completed(syncVal) : SimpleAwaitable<T>.Pending(node!);
+    }
+
+    public sealed class SimpleNode<TValue>
+    {
+        private const int MaxCached = 128;
+        [ThreadStatic] private static SimpleNode<TValue>? _free;
+        [ThreadStatic] private static int _freeCount;
+
+        public SimpleNode<TValue>? Next;
+        public SimpleChannel<TValue>? Channel;
+        public TValue? Value;
+        public Action? Continuation;
+        public bool IsCompleted;
+        public bool IsPut;
+
+        public static SimpleNode<TValue> Rent()
+        {
+            var item = _free;
+            if (item is null) return new SimpleNode<TValue>();
+            _free = item.Next;
+            _freeCount--;
+            item.Next = null;
+            item.IsCompleted = false;
+            return item;
+        }
+
+        public void Return()
+        {
+            Next = null;
+            Channel = null;
+            Value = default;
+            Continuation = null;
+            IsCompleted = false;
+            IsPut = false;
+
+            if (_freeCount < MaxCached)
+            {
+                Next = _free;
+                _free = this;
+                _freeCount++;
+            }
+        }
+    }
+
+    public readonly struct SimpleAwaitable<TValue> : ICriticalNotifyCompletion
+    {
+        private readonly SimpleNode<TValue>? _node;
+        private readonly TValue? _syncValue;
+        private readonly bool _isCompleted;
+
+        private SimpleAwaitable(TValue? syncValue, SimpleNode<TValue>? node, bool isCompleted)
+        {
+            _syncValue = syncValue;
+            _node = node;
+            _isCompleted = isCompleted;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static SimpleAwaitable<TValue> Completed(TValue? value) => new(value, null, true);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static SimpleAwaitable<TValue> Pending(SimpleNode<TValue> node) => new(default, node, false);
+
+        public SimpleAwaitable<TValue> GetAwaiter() => this;
+        public bool IsCompleted => _isCompleted;
+
+        public TValue GetResult()
+        {
+            if (_isCompleted) return _syncValue!;
+            var node = _node!;
+            var val = node.Value!;
+            node.Return();
+            return val;
+        }
+
+        public void OnCompleted(Action continuation) => UnsafeOnCompleted(continuation);
+
+        public void UnsafeOnCompleted(Action continuation)
+        {
+            if (_isCompleted)
+            {
+                Scheduler.Dispatch(continuation);
+                return;
+            }
+
+            var node = _node!;
+            var ch = node.Channel;
+            if (ch is null)
+            {
+                Scheduler.Dispatch(continuation);
+                return;
+            }
+
+            bool dispatchNow = false;
+            lock (ch._lock)
+            {
+                if (node.IsCompleted)
+                {
+                    dispatchNow = true;
+                }
+                else
+                {
+                    node.Continuation = continuation;
+                }
+            }
+
+            if (dispatchNow)
+            {
+                Scheduler.Dispatch(continuation);
+            }
+        }
     }
 }
