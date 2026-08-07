@@ -437,12 +437,66 @@ Independent confirmation: the `trial/own-workers` branch reproduced Hopac's clif
 almost exactly. Hand-written workers with a global queue measured 299 ns/op for the
 same storm without batching, and 109 with it.
 
-### Where Hopac is better, and it is worth taking seriously
+### Where Hopac is better — much less than the table above suggests
 
-**Select/Choose: 141 vs 211.** Hopac is 33% faster at the operation that is the whole
-point of CML, while allocating 528 B/op against BjoML's 40. So it is not winning by
-being cheap — its `Alt` machinery is simply better than BjoML's `SyncState`. That is
-the clearest optimisation target in the codebase.
+**The `Select/Choose` row is not trustworthy, and neither is any other single-shot
+row.** The suites run each benchmark exactly once, which on .NET measures a
+partially tiered-JIT'd method rather than steady-state code.
+
+`bench/Diag --mode select` and `bench/hopac select` run the same benchmark in
+isolation with repetitions. The warm-up curves, ns/op per repetition:
+
+```
+BjoML   176  187  190  112   72   91   92   93   93   93   94   93  100   93   94
+Hopac   161   88   95   91   86   82   81   83   83   91   85   83   81   90   82
+```
+
+BjoML needs **four** repetitions to reach steady state; Hopac needs **one**. The
+single-shot suite therefore penalises BjoML far more than Hopac, and the "141 vs 211"
+in the table above is mostly that artifact.
+
+Steady state, medians of 15 repetitions across 4 separate process invocations:
+
+| | single-shot (suite) | steady state |
+|---|---|---|
+| BjoML | 211 | **94** (91, 95, 94, 95) |
+| Hopac | 141 | **85** |
+
+So Hopac's `Alt` is about **10% faster, not 33%**, and BjoML's `SyncState` is not the
+weak point it appeared to be.
+
+### Two attempts to explain the remaining 9 ns, both falsified
+
+Reading the two implementations suggested BjoML pays more per rendezvous:
+`SyncState.MarkSynchronized` takes `lock (this)` unconditionally — twice per
+rendezvous, once for each side — to walk a nack list that is empty in this benchmark,
+where Hopac's `Pick.SetNacks` is a null check because the Pick's `Claimed` state
+doubles as the mutex. And `NextEventId()` is an `Interlocked.Increment` where Hopac
+threads a plain `int` down the `TryAlt` chain.
+
+Both were tested by deliberately breaking them and re-measuring:
+
+| variant | median ns/op |
+|---|---|
+| baseline | 94 (91, 95, 94, 95) |
+| `MarkSynchronized` lock removed entirely | 93 |
+| `NextEventId` as a plain increment | 96 (97, 96, 96, 94) |
+
+**Neither changes anything measurable.** An uncontended `Monitor` on a hot cache line
+costs far less than the ~20 ns assumed, and one `Interlocked.Increment` on a
+just-allocated object is close to free. The remaining ~9 ns is unattributed; it wants
+a profiler, not more code reading.
+
+(An intermediate run showed 113 and another 89. Both were noise — repeated invocations
+put every variant in the 91–97 band. Single invocations cannot resolve differences of
+this size, which is worth remembering before acting on any 5–10 ns "win".)
+
+### Consequence for the rest of this document
+
+Every cross-runtime row above is single-shot and therefore carries the same warm-up
+bias, in BjoML's disfavour. `Ring` at 62 vs 76 and `Ping-pong` at 193 vs 191 should be
+re-measured with repetitions before being relied on. The spawn-storm conclusion is the
+exception: a 10x foreign/inside cliff is far too large to be a JIT artifact.
 
 ### Where BjoML is better
 

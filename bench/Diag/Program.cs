@@ -94,6 +94,7 @@ public static class Program
         }
 
         if (mode == "fanout") { FanoutHarness.Run(reps); return; }
+        if (mode == "select") { SelectHarness.Run(reps); return; }
 
         Console.WriteLine($".NET {Environment.Version}  ProcessorCount={Environment.ProcessorCount}  " +
                           $"ServerGC={System.Runtime.GCSettings.IsServerGC}  {System.Runtime.GCSettings.LatencyMode}");

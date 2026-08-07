@@ -314,8 +314,39 @@ let private warmup () =
         queue (Ch.give ch 1)
         run (Ch.take ch) |> ignore
 
-[<EntryPoint>]
-let main _ =
+/// One Select round, returning ns/op. Used by the repeated mode below.
+let private selectOnce rounds =
+    let a = Ch<int>()
+    let b = Ch<int>()
+    let finished = IVar<unit>()
+
+    queue (selectSender a b 0 rounds >>= fun () -> IVar.tryFill finished ())
+
+    let sw = Stopwatch.StartNew()
+    let choice = Ch.take a <|> Ch.take b
+    run (selectReceiver choice rounds)
+    run (IVar.read finished)
+    sw.Stop()
+
+    sw.Elapsed.TotalMilliseconds * 1_000_000.0 / float rounds
+
+/// Select measured in isolation with repetitions.
+///
+/// The full suite runs each benchmark exactly once, which on .NET means measuring a
+/// partially tiered-JIT'd method. BjoML's Select moved from 211 ns/op single-shot to
+/// 97 ns/op by the fifth repetition, so the single-shot cross-runtime comparison was
+/// not measuring what it claimed to. This gives Hopac the same treatment.
+let selectRepeated reps =
+    selectOnce 200_000 |> ignore   // warm up
+
+    let samples = Array.init reps (fun _ -> selectOnce 1_000_000)
+    let sorted = Array.sort samples
+
+    printfn "Select/Choose  per rep: %s"
+        (samples |> Array.map (sprintf "%6.0f") |> String.concat " ")
+    printfn "               median : %.0f ns/op" sorted.[reps / 2]
+
+let private mainSuite () =
     printfn ".NET %O, ProcessorCount=%d, ServerGC=%b, Hopac %s"
         Environment.Version
         Environment.ProcessorCount
@@ -333,3 +364,17 @@ let main _ =
     selectChoose ()
     fanOut ()
     0
+
+[<EntryPoint>]
+let main argv =
+    if argv |> Array.contains "select" then
+        let reps = if argv.Length > 1 then int argv.[1] else 9
+        printfn ".NET %O, ProcessorCount=%d, ServerGC=%b, reps=%d"
+            Environment.Version Environment.ProcessorCount
+            System.Runtime.GCSettings.IsServerGC reps
+        printfn ""
+        warmup ()
+        selectRepeated reps
+        0
+    else
+        mainSuite ()
