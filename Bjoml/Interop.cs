@@ -47,28 +47,7 @@ public static class Bjo
     {
         var inherited = FiberContext.Current;
         var handle = new Promise<T>();
-
-        Scheduler.Enqueue(() =>
-        {
-            var prev = FiberContext.Current;
-            FiberContext.Current = inherited;
-            try
-            {
-                body().AsPromise().Forward(handle);
-            }
-            catch (Exception e)
-            {
-                // Thrown before the state machine got going, e.g. an argument check
-                // in a non-async wrapper. Once the state machine is running, the
-                // builder routes exceptions to SetException instead.
-                handle.TrySetException(e);
-            }
-            finally
-            {
-                FiberContext.Current = prev;
-            }
-        });
-
+        Scheduler.Enqueue(SpawnWorkItem<T>.Rent(body, inherited, handle));
         return handle;
     }
 
@@ -77,25 +56,7 @@ public static class Bjo
     {
         var inherited = FiberContext.Current;
         var handle = new Promise<Unit>();
-
-        Scheduler.Enqueue(() =>
-        {
-            var prev = FiberContext.Current;
-            FiberContext.Current = inherited;
-            try
-            {
-                body().AsPromise().Forward(handle);
-            }
-            catch (Exception e)
-            {
-                handle.TrySetException(e);
-            }
-            finally
-            {
-                FiberContext.Current = prev;
-            }
-        });
-
+        Scheduler.Enqueue(SpawnWorkItem.Rent(body, inherited, handle));
         return handle;
     }
 
@@ -147,6 +108,140 @@ public static class Bjo
         lock (gate)
         {
             while (!completed) Monitor.Wait(gate);
+        }
+    }
+}
+
+internal sealed class SpawnWorkItem<T> : IThreadPoolWorkItem
+{
+    private const int MaxCached = 64;
+    [ThreadStatic] private static SpawnWorkItem<T>? _free;
+    [ThreadStatic] private static int _freeCount;
+
+    private SpawnWorkItem<T>? _next;
+    private Func<Fiber<T>> _body = null!;
+    private object? _inherited;
+    private Promise<T> _handle = null!;
+
+    public static SpawnWorkItem<T> Rent(Func<Fiber<T>> body, object? inherited, Promise<T> handle)
+    {
+        var item = _free;
+        if (item is null)
+        {
+            return new SpawnWorkItem<T>
+            {
+                _body = body,
+                _inherited = inherited,
+                _handle = handle
+            };
+        }
+
+        _free = item._next;
+        _freeCount--;
+        item._next = null;
+        item._body = body;
+        item._inherited = inherited;
+        item._handle = handle;
+        return item;
+    }
+
+    public void Execute()
+    {
+        var body = _body;
+        var inherited = _inherited;
+        var handle = _handle;
+
+        _body = null!;
+        _inherited = null;
+        _handle = null!;
+
+        if (_freeCount < MaxCached)
+        {
+            _next = _free;
+            _free = this;
+            _freeCount++;
+        }
+
+        var prev = FiberContext.Current;
+        FiberContext.Current = inherited;
+        try
+        {
+            body().AsPromise().Forward(handle);
+        }
+        catch (Exception e)
+        {
+            handle.TrySetException(e);
+        }
+        finally
+        {
+            FiberContext.Current = prev;
+        }
+    }
+}
+
+internal sealed class SpawnWorkItem : IThreadPoolWorkItem
+{
+    private const int MaxCached = 64;
+    [ThreadStatic] private static SpawnWorkItem? _free;
+    [ThreadStatic] private static int _freeCount;
+
+    private SpawnWorkItem? _next;
+    private Func<Fiber> _body = null!;
+    private object? _inherited;
+    private Promise<Unit> _handle = null!;
+
+    public static SpawnWorkItem Rent(Func<Fiber> body, object? inherited, Promise<Unit> handle)
+    {
+        var item = _free;
+        if (item is null)
+        {
+            return new SpawnWorkItem
+            {
+                _body = body,
+                _inherited = inherited,
+                _handle = handle
+            };
+        }
+
+        _free = item._next;
+        _freeCount--;
+        item._next = null;
+        item._body = body;
+        item._inherited = inherited;
+        item._handle = handle;
+        return item;
+    }
+
+    public void Execute()
+    {
+        var body = _body;
+        var inherited = _inherited;
+        var handle = _handle;
+
+        _body = null!;
+        _inherited = null;
+        _handle = null!;
+
+        if (_freeCount < MaxCached)
+        {
+            _next = _free;
+            _free = this;
+            _freeCount++;
+        }
+
+        var prev = FiberContext.Current;
+        FiberContext.Current = inherited;
+        try
+        {
+            body().AsPromise().Forward(handle);
+        }
+        catch (Exception e)
+        {
+            handle.TrySetException(e);
+        }
+        finally
+        {
+            FiberContext.Current = prev;
         }
     }
 }

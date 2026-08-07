@@ -54,6 +54,10 @@ public static class Cml
     }
 
     // Combinators
+    public static IEvent<T> Choose<T>(IEvent<T> ev1, IEvent<T> ev2) => new PairChooseEvent<T>(ev1, ev2);
+
+    public static IEvent<T> Choose<T>(IEvent<T> ev1, IEvent<T> ev2, IEvent<T> ev3) => new TripleChooseEvent<T>(ev1, ev2, ev3);
+
     public static IEvent<T> Choose<T>(params IEvent<T>[] events) => new ChooseEvent<T>(events);
     
     public static IEvent<U> Wrap<T, U>(IEvent<T> ev, Func<T, U> mapper) => new WrapEvent<T, U>(ev, mapper);
@@ -68,6 +72,54 @@ public static class Cml
 }
 
 // ---------------- Implementation of Combinators ----------------
+
+/// <summary>
+/// Optimized binary choice between two events, avoiding array allocation and loop overhead.
+/// </summary>
+public sealed class PairChooseEvent<T> : IEvent<T>
+{
+    private readonly IEvent<T> _ev1;
+    private readonly IEvent<T> _ev2;
+
+    public PairChooseEvent(IEvent<T> ev1, IEvent<T> ev2)
+    {
+        _ev1 = ev1;
+        _ev2 = ev2;
+    }
+
+    public void Publish(SyncState sharedState, int eventId, Action<T> onSync)
+    {
+        _ev1.Publish(sharedState, sharedState.NextEventId(), onSync);
+        if (sharedState.IsSynchronized) return;
+        _ev2.Publish(sharedState, sharedState.NextEventId(), onSync);
+    }
+}
+
+/// <summary>
+/// Optimized ternary choice between three events, avoiding array allocation and loop overhead.
+/// </summary>
+public sealed class TripleChooseEvent<T> : IEvent<T>
+{
+    private readonly IEvent<T> _ev1;
+    private readonly IEvent<T> _ev2;
+    private readonly IEvent<T> _ev3;
+
+    public TripleChooseEvent(IEvent<T> ev1, IEvent<T> ev2, IEvent<T> ev3)
+    {
+        _ev1 = ev1;
+        _ev2 = ev2;
+        _ev3 = ev3;
+    }
+
+    public void Publish(SyncState sharedState, int eventId, Action<T> onSync)
+    {
+        _ev1.Publish(sharedState, sharedState.NextEventId(), onSync);
+        if (sharedState.IsSynchronized) return;
+        _ev2.Publish(sharedState, sharedState.NextEventId(), onSync);
+        if (sharedState.IsSynchronized) return;
+        _ev3.Publish(sharedState, sharedState.NextEventId(), onSync);
+    }
+}
 
 /// <summary>
 /// Combines multiple events into a single choice. 
