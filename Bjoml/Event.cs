@@ -34,7 +34,10 @@ public static class Cml
     public static void Sync<T>(IEvent<T> ev, Action<T> continuation)
     {
         var state = new SyncState();
-        ev.Publish(state, state.GenerateEventId(), continuation);
+
+        // The root of the event-id tree. Every id minted below this one is a
+        // descendant of it, so a nack attached at the root never fires.
+        ev.Publish(state, SyncState.RootEventId, continuation);
     }
 
     public static ValueTask<T> SyncAsync<T>(IEvent<T> ev)
@@ -79,13 +82,19 @@ public class ChooseEvent<T> : IEvent<T>
 
     public void Publish(SyncState sharedState, int eventId, Action<T> onSync)
     {
-        // For choose, we generate a NEW Event ID for each branch.
-        // This is strictly necessary because if branch A wins, we MUST fire the NACKs for branch B and C.
-        // By giving them different EventIDs under the same SyncState, the SyncState knows exactly which 
-        // branch won and can fire the NACKs belonging to the losers.
+        // Each branch gets a NEW event id, because if branch A wins we must fire the
+        // nacks for B and C. The id is minted as a CHILD of the incoming id rather
+        // than from a flat counter: an enclosing withNack identifies its subtree by
+        // its own id, and if choose reparented its branches to nowhere, that
+        // withNack would fire its nack even when one of its own branches won.
         foreach (var ev in _events)
         {
-            ev.Publish(sharedState, sharedState.GenerateEventId(), onSync);
+            // An earlier branch may have committed inline (Always, an already-queued
+            // partner, a completed Promise). Publishing the rest would only queue
+            // operations that can never win.
+            if (sharedState.IsSynchronized) return;
+
+            ev.Publish(sharedState, sharedState.GenerateChildId(eventId), onSync);
         }
     }
 }
@@ -149,15 +158,23 @@ public class WithNackEvent<T> : IEvent<T>
 
     public void Publish(SyncState sharedState, int eventId, Action<T> onSync)
     {
-        var nackChan = new Channel<Unit>();
-        
-        // We register the NACK callback on the shared state, bound specifically to OUR 'eventId'.
-        // If the sharedState is synchronized by any other EventID, it will trigger this callback.
-        // We use a completely independent SyncState (new SyncState()) for the nackChan's PublishSend 
-        // because the NACK delivery is a distinct rendezvous.
-        sharedState.RegisterNack(eventId, () => nackChan.PublishSend(new SyncState(), 1, new Unit(), () => { }));
+        // The nack is carried by a Promise, not a Channel.
+        //
+        // A channel-based nack is EPHEMERAL: firing it parks a PutOp that only a
+        // receiver can consume, so a nack nobody listens to leaves an operation
+        // stranded in a channel that is then unreachable forever. A promise is
+        // PERSISTENT, which is also the better semantics: "this branch lost" is a
+        // fact, not a message, so every listener should see it and a listener that
+        // arrives late should still see it.
+        var nack = new Promise<Unit>();
 
-        var ev = _generator(new ChannelReceiveEvent<Unit>(nackChan));
+        // Bound specifically to OUR eventId. The shared state fires this only if it
+        // is synchronized by an event OUTSIDE our subtree.
+        sharedState.RegisterNack(eventId, () => nack.TrySetResult(default));
+
+        // A nack promise is only ever completed successfully, so the Result wrapper
+        // can be projected away.
+        var ev = _generator(Cml.Wrap(nack.Join(), static r => r.Value));
         
         // Publish the generated event WITH OUR EVENT ID. 
         // This means if `ev` wins, it identifies itself to the SyncState using our eventId, 
@@ -173,12 +190,13 @@ public class AlwaysEvent<T> : IEvent<T>
 
     public void Publish(SyncState sharedState, int eventId, Action<T> onSync)
     {
-        // It immediately attempts to claim the state. If it succeeds, it bypasses queues entirely.
-        if (sharedState.TryClaim())
-        {
-            sharedState.MarkSynchronized(eventId);
+        // Commit outright, bypassing the queues entirely.
+        //
+        // TryCommit rather than TryClaim + MarkSynchronized: a bare TryClaim treats
+        // a transient C (some other branch mid-pairing) as "already lost" and
+        // silently drops an event that is always enabled.
+        if (sharedState.TryCommit(eventId))
             Scheduler.Dispatch(onSync, _value);
-        }
     }
 }
 

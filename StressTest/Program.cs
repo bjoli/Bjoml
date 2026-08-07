@@ -17,6 +17,7 @@
 
 using System;
 using System.Diagnostics;
+using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using Bjoml;
 
@@ -37,6 +38,10 @@ class Program
         await RunProducerConsumerBenchmark();
         Console.WriteLine();
         await RunSimpleProducerConsumerBenchmark();
+        Console.WriteLine();
+        await RunFiberRingBenchmark();
+        Console.WriteLine();
+        await RunFanOutBenchmark();
         Console.WriteLine();
         await RunCombinatorTest();
 
@@ -271,6 +276,141 @@ class Program
         await Task.WhenAll(consumers);
         sw.Stop();
         Console.WriteLine($"SimpleChannel Producer/Consumer finished in {sw.ElapsedMilliseconds} ms. Total Messages Processed: {totalReceived}");
+    }
+
+    /// <summary>
+    /// The same ring, but every node is a Fiber awaiting IEvent directly instead of a
+    /// Task awaiting a pooled ValueTask source. This is the path the compiled language
+    /// actually uses, so it is the number that matters.
+    /// </summary>
+    static async Task RunFiberRingBenchmark()
+    {
+        const int numWorkers = 1000;
+        const int numTrips = 1000;
+
+        Console.WriteLine($"--- Fiber Ring Benchmark: {numWorkers} workers, {numTrips} trips around the ring ---");
+
+        var channels = new Channel<int>[numWorkers];
+        for (int i = 0; i < numWorkers; i++) channels[i] = new Channel<int>();
+
+        var handles = new Promise<Unit>[numWorkers];
+
+        for (int i = 0; i < numWorkers; i++)
+        {
+            int workerId = i;
+            var inChannel = channels[workerId];
+            var outChannel = channels[(workerId + 1) % numWorkers];
+            bool isLast = workerId == numWorkers - 1;
+
+            handles[i] = Bjo.Spawn(() => RingNode(inChannel, outChannel, isLast, numTrips));
+        }
+
+        var sw = Stopwatch.StartNew();
+
+        await Cml.SyncAsyncVoid(new ChannelSendEvent<int>(channels[0], 0));
+
+        foreach (var h in handles) await h.ToTask();
+
+        sw.Stop();
+        Console.WriteLine($"Fiber Ring Benchmark finished in {sw.ElapsedMilliseconds} ms. Passed {numWorkers * numTrips} messages.");
+    }
+
+    static async Fiber RingNode(Channel<int> inChannel, Channel<int> outChannel, bool isLast, int numTrips)
+    {
+        while (true)
+        {
+            int msg = await inChannel.Receive();
+
+            if (msg == -1)
+            {
+                if (!isLast) await outChannel.Send(-1);
+                return;
+            }
+
+            if (isLast)
+            {
+                msg++;
+                if (msg >= numTrips)
+                {
+                    await outChannel.Send(-1);
+                    continue;
+                }
+            }
+
+            await outChannel.Send(msg);
+        }
+    }
+
+    /// <summary>
+    /// The workload the old scheduler could not do: one fiber spawning many children.
+    ///
+    /// With per-worker queues and no stealing, a fiber running on worker 3 enqueued
+    /// every child onto worker 3's own queue, so the whole fan-out ran on ONE core
+    /// while the others sat blocked in GetConsumingEnumerable. On the .NET pool the
+    /// children are stealable, so this should scale with core count.
+    /// </summary>
+    static async Task RunFanOutBenchmark()
+    {
+        const int numChildren = 480;
+        const int iterationsPerChild = 3_000_000;
+
+        Console.WriteLine($"--- Fan-Out: 1 fiber spawns {numChildren} children, {iterationsPerChild} iterations of CPU work each ---");
+
+        // Serial reference, so the speedup claim is measured rather than assumed.
+        var serialSw = Stopwatch.StartNew();
+        BurnCore(iterationsPerChild);
+        serialSw.Stop();
+        double serialTotalMs = serialSw.Elapsed.TotalMilliseconds * numChildren;
+
+        var sw = Stopwatch.StartNew();
+        await Bjo.Spawn(() => FanOutParent(numChildren, iterationsPerChild)).ToTask();
+        sw.Stop();
+
+        Console.WriteLine(
+            $"Fan-Out finished in {sw.ElapsedMilliseconds} ms on {Environment.ProcessorCount} logical cores " +
+            $"(serial reference {serialTotalMs:F0} ms, speedup {serialTotalMs / sw.Elapsed.TotalMilliseconds:F1}x).");
+    }
+
+    static async Fiber FanOutParent(int numChildren, int iterations)
+    {
+        var children = new Promise<Unit>[numChildren];
+
+        // Spawned from INSIDE a fiber, which is the case the old scheduler pinned.
+        for (int i = 0; i < numChildren; i++)
+            children[i] = Bjo.Spawn(() => Burn(iterations));
+
+        var doneChannel = new Channel<int>();
+
+        for (int i = 0; i < numChildren; i++)
+        {
+            var child = children[i];
+            Bjo.Spawn(() => Notify(child, doneChannel));
+        }
+
+        for (int i = 0; i < numChildren; i++)
+            await doneChannel.Receive();
+    }
+
+    static async Fiber Notify(Promise<Unit> child, Channel<int> done)
+    {
+        await child;
+        await done.Send(1);
+    }
+
+    static async Fiber Burn(int iterations)
+    {
+        // Deliberately synchronous CPU work with no suspension, so the only thing
+        // being measured is whether the scheduler spread the children across cores.
+        BurnCore(iterations);
+        await Cml.Always(0);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static void BurnCore(int iterations)
+    {
+        double acc = 0;
+        for (int i = 1; i <= iterations; i++) acc += 1.0 / i;
+        if (acc < 0) throw new Exception("unreachable");
     }
 
     static async Task RunCombinatorTest()

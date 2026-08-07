@@ -21,6 +21,25 @@ using Microsoft.Extensions.ObjectPool;
 
 namespace Bjoml;
 
+/// <summary>
+/// Pooled <see cref="IValueTaskSource{T}"/> backing the plain-C# <c>ValueTask</c>
+/// surface (<see cref="ChannelExtensions"/>, <see cref="SimpleChannel{T}"/>).
+///
+/// This is the interop path, not the fiber path. Fibers await
+/// <see cref="EventAwaiter{T}"/> directly and never allocate one of these.
+///
+/// KNOWN LEAK: <see cref="GetResult"/> is what resets the core and returns the
+/// source to the pool, so a <c>ValueTask</c> that is created and never awaited is
+/// never recycled and keeps its continuation and result alive. In the hosted
+/// language, <c>(put! ch v)</c> in statement position looks exactly like a discard,
+/// so the compiler must always await it — or, better, use the event/awaiter path,
+/// which has no pooled source at all.
+///
+/// <c>_core.RunContinuationsAsynchronously</c> is deliberately left false, so a
+/// continuation runs inline inside <c>SetResult</c>, inside <c>Scheduler.Dispatch</c>,
+/// inside the channel matching loop. That is what we want for latency, but it means
+/// <see cref="Scheduler.MaxInlineDepth"/> is the only bound on stack growth.
+/// </summary>
 internal sealed class CmlValueTaskSource<T> : IValueTaskSource<T>, IValueTaskSource
 {
     private static readonly ObjectPool<CmlValueTaskSource<T>> _pool = ObjectPool.Create<CmlValueTaskSource<T>>();

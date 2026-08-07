@@ -23,17 +23,21 @@ public abstract class Operation
 {
     // Every queued operation holds a reference to the SyncState of the 'Cml.Sync' block that created it.
     // By locking and mutating this shared state, we pair operations atomically.
-    public SyncState State; 
+    // Assigned by the channel immediately after renting from the pool, never by a
+    // constructor, hence the null-forgiving initialiser.
+    public SyncState State = null!;
     
     // The specific EventId for this branch in a 'Choose' block. 
     // This allows the SyncState to know which branch won, so it can fire the NACKs for the losers.
     public int EventId;
 
     public bool IsSynchronized => State.IsSynchronized;
-    public bool TryClaim() => State.TryClaim();
+
+    /// <summary>
+    /// Drive this (the opposing party's) block straight to Synchronized. The caller
+    /// must already hold a claim on its own block.
+    /// </summary>
     public bool TrySync() => State.TrySync();
-    public void MarkSynchronized() => State.MarkSynchronized(EventId);
-    public void ResetClaim() => State.ResetClaim();
 }
 
 /// <summary>
@@ -43,8 +47,8 @@ public abstract class Operation
 /// </summary>
 public class PutOp<T> : Operation, IResettable
 {
-    public T Value;
-    public Action ResumePut;
+    public T Value = default!;
+    public Action ResumePut = null!;
 
     public bool TryReset()
     {
@@ -63,7 +67,7 @@ public class PutOp<T> : Operation, IResettable
 /// </summary>
 public class GetOp<T> : Operation, IResettable
 {
-    public Action<T> ResumeGet;
+    public Action<T> ResumeGet = null!;
 
     public bool TryReset()
     {

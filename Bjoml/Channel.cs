@@ -16,267 +16,267 @@
 // along with BjoML.  If not, see <https://www.gnu.org/licenses/>.
 
 using System;
+using System.Collections.Generic;
 using System.Collections.Concurrent;
+using System.Threading;
 using Microsoft.Extensions.ObjectPool;
 
 namespace Bjoml;
 
+/// <summary>
+/// Shared operation pools, one set per element type rather than per channel.
+///
+/// A per-<c>Channel</c> pool gives no benefit to a program that creates many
+/// short-lived channels — every channel starts with an empty pool and pays for the
+/// pool object itself — while the operations are entirely channel-agnostic.
+/// </summary>
+internal static class OpPool<T>
+{
+    internal static readonly ObjectPool<PutOp<T>> Put = ObjectPool.Create<PutOp<T>>();
+    internal static readonly ObjectPool<GetOp<T>> Get = ObjectPool.Create<GetOp<T>>();
+}
+
 public class Channel<T>
 {
-    // We use ConcurrentQueues to hold unmatched operations. A channel is fundamentally a rendezvous point.
-    // If a Send arrives before a Receive, it is queued in _putq. If a Receive arrives first, it is queued in _getq.
+    // A channel is a rendezvous point. If a Send arrives first it parks in _putq;
+    // if a Receive arrives first it parks in _getq. At most one queue is non-empty
+    // in the steady state.
     internal readonly ConcurrentQueue<PutOp<T>> _putq = new();
     internal readonly ConcurrentQueue<GetOp<T>> _getq = new();
 
-    // Object pooling is crucial here. In highly concurrent scenarios (like the ring benchmark), 
-    // allocating new Operation objects for every message would cause massive GC pressure.
-    // By pooling, we achieve zero-allocation steady-state message passing.
-    internal readonly ObjectPool<PutOp<T>> _putPool = ObjectPool.Create<PutOp<T>>();
-    internal readonly ObjectPool<GetOp<T>> _getPool = ObjectPool.Create<GetOp<T>>();
+    /// <summary>
+    /// Number of parked receive operations. Test-only observability.
+    ///
+    /// Tests need a genuine "the fiber has suspended here" signal. A handshake over
+    /// another channel does NOT provide one: the matching loop dispatches the
+    /// PARTNER's continuation inline from inside the awaiter's constructor, so the
+    /// partner can observe the rendezvous before the fiber has advanced to its next
+    /// await, let alone parked on it.
+    ///
+    /// Includes operations already won by another branch, so only trust it on a
+    /// channel the test controls.
+    /// </summary>
+    internal int PendingReceiveCount => _getq.Count;
+
+    /// <summary>Number of parked send operations. Test-only observability.</summary>
+    internal int PendingSendCount => _putq.Count;
+
+    private enum MatchOutcome
+    {
+        /// <summary>Paired successfully; both continuations have been dispatched.</summary>
+        Matched,
+
+        /// <summary>
+        /// We could not claim our OWN state, meaning another thread is already
+        /// fulfilling us. It owns our continuation now; we must not touch anything.
+        /// </summary>
+        Aborted,
+
+        /// <summary>Opposing queue ran dry without a match.</summary>
+        Exhausted,
+    }
+
+    // -----------------------------------------------------------------------
+    // Send
+    // -----------------------------------------------------------------------
 
     public void PublishSend(SyncState state, int eventId, T value, Action resumePut)
     {
-        // FAST PATH: Try to match without enqueueing ourselves
-        while (_getq.TryDequeue(out var getOp))
-        {
-            if (getOp.IsSynchronized) 
-            {
-                _getPool.Return(getOp);
-                continue;
-            }
+        // FAST PATH: try to pair without ever touching the queue.
+        if (TryMatchGet(state, eventId, value, resumePut) != MatchOutcome.Exhausted)
+            return;
 
-            if (state.TryClaim())
-            {
-                if (getOp.TrySync())
-                {
-                    var getResume = getOp.ResumeGet;
-                    state.MarkSynchronized(eventId);
-                    getOp.State.MarkSynchronized(getOp.EventId);
-
-                    var myResume = resumePut;
-                    T capturedValue = value;
-
-                    Scheduler.Dispatch(myResume);
-                    Scheduler.Dispatch(getResume, capturedValue);
-                    
-                    _getPool.Return(getOp);
-                    return;
-                }
-                else
-                {
-                    state.ResetClaim();
-                    if (getOp.IsSynchronized)
-                        _getPool.Return(getOp);
-                    else
-                    {
-                        _getq.Enqueue(getOp); 
-                        System.Threading.Thread.Yield();
-                    }
-                }
-            }
-            else
-            {
-                if (getOp.IsSynchronized)
-                    _getPool.Return(getOp);
-                else
-                    _getq.Enqueue(getOp);
-                return;
-            }
-        }
-
-        // SLOW PATH: We must enqueue ourselves and search again to prevent races
-        var myOp = _putPool.Get();
+        // SLOW PATH. We must publish ourselves BEFORE searching again: if a sender
+        // and a receiver both searched before enqueueing, both would see empty
+        // queues, both would park, and neither would ever be found.
+        var myOp = OpPool<T>.Put.Get();
         myOp.State = state;
         myOp.EventId = eventId;
         myOp.Value = value;
         myOp.ResumePut = resumePut;
-
-        // We MUST enqueue our operation first before searching the opposing queue.
-        // If both a sender and a receiver search before enqueueing, they would both see empty queues, 
-        // enqueue themselves, and then wait forever. Enqueueing first ensures at least one will find the other.
         _putq.Enqueue(myOp);
 
-        while (_getq.TryDequeue(out var getOp))
+        // If this pairs, myOp is left behind in _putq already marked synchronized;
+        // the next passer-by reclaims it.
+        TryMatchGet(state, eventId, value, resumePut);
+    }
+
+    private MatchOutcome TryMatchGet(SyncState state, int eventId, T value, Action resumePut)
+    {
+        List<GetOp<T>>? deferred = null;
+        try
         {
-            if (getOp.IsSynchronized) 
+            while (_getq.TryDequeue(out var getOp))
             {
-                // This operation was already fulfilled by another thread. We discard it.
-                _getPool.Return(getOp);
-                continue;
-            }
-
-            // We must 'Claim' our own state first. This prevents another thread from fulfilling our operation 
-            // while we are in the middle of fulfilling this getOp.
-            if (state.TryClaim())
-            {
-                // We successfully claimed our state. Now we try to claim the receiver's state.
-                if (getOp.TrySync())
+                // A sync block may never pair with itself. Without this, a perfectly
+                // legal (choose (send ch v) (recv ch)) livelocks a whole thread
+                // forever: we claim our state W->C, then try to drive the SAME state
+                // W->S, which fails because it is now C, so we reset, re-queue, yield
+                // and repeat. Thread.Yield cannot break the tie because there is no
+                // other party involved.
+                if (ReferenceEquals(getOp.State, state))
                 {
-                    // Success! We have atomically paired the Send and Receive operations.
-                    var getResume = getOp.ResumeGet;
-                    
-                    // Mark both states as permanently Synchronized. This also triggers any registered Negative Acknowledgements (NACKs)
-                    // for other choices in a 'Cml.Choose' block that lost the race.
-                    state.MarkSynchronized(eventId);
-                    getOp.State.MarkSynchronized(getOp.EventId);
-
-                    var myResume = resumePut;
-                    T capturedValue = value;
-
-                    // We dispatch the continuations to the ThreadPool. We do NOT run them inline because 
-                    // inline execution could lead to unbounded stack growth or thread starvation if the continuations block.
-                    Scheduler.Dispatch(myResume);
-                    Scheduler.Dispatch(getResume, capturedValue);
-                    
-                    _getPool.Return(getOp);
-                    return;
+                    (deferred ??= new List<GetOp<T>>()).Add(getOp);
+                    continue;
                 }
-                else
+
+                if (getOp.IsSynchronized)
                 {
-                    // We failed to sync the receiver's state because another thread is currently inspecting it (Claimed)
-                    // or already fulfilled it (Synchronized).
-                    // We MUST release our claim so that other threads can interact with our operation.
+                    OpPool<T>.Get.Return(getOp);
+                    continue;
+                }
+
+                // Claim our own state first, so nobody can fulfil us while we are
+                // busy fulfilling this getOp.
+                if (state.TryClaim())
+                {
+                    if (getOp.TrySync())
+                    {
+                        // Paired. Read everything off getOp before recycling it.
+                        var getResume = getOp.ResumeGet;
+                        var getState = getOp.State;
+                        int getEventId = getOp.EventId;
+
+                        // Drives both blocks to S and fires the nacks of every
+                        // losing choose branch on both sides.
+                        state.MarkSynchronized(eventId);
+                        getState.MarkSynchronized(getEventId);
+
+                        OpPool<T>.Get.Return(getOp);
+
+                        Scheduler.Dispatch(resumePut);
+                        Scheduler.Dispatch(getResume, value);
+                        return MatchOutcome.Matched;
+                    }
+
+                    // The receiver was claimed by someone else, or already finished.
+                    // Release our own claim so others can interact with us again.
                     state.ResetClaim();
+
                     if (getOp.IsSynchronized)
-                        _getPool.Return(getOp);
+                    {
+                        OpPool<T>.Get.Return(getOp);
+                    }
                     else
                     {
-                        // The receiver's state was Claimed but not yet Synchronized.
-                        // We must put the getOp back in the queue so it isn't lost if the other thread backs off.
-                        _getq.Enqueue(getOp); 
-                        
-                        // CRITICAL: We yield the thread here to prevent a Livelock. 
-                        // If we didn't yield, two threads could endlessly dequeue each other's operations, 
-                        // fail the TrySync (because both are Claimed), put them back, and repeat forever without making progress.
-                        System.Threading.Thread.Yield();
+                        // Claimed but not yet synchronized: put it back so it is not
+                        // lost if the other thread backs off, and yield to avoid two
+                        // threads endlessly swapping each other's operations.
+                        _getq.Enqueue(getOp);
+                        Thread.Yield();
                     }
                 }
-            }
-            else
-            {
-                // We failed to claim our OWN state. This means another thread found our operation in the queue 
-                // and is actively fulfilling it.
-                // We MUST put the getOp back in the queue, because we are aborting our search and leaving it unmatched.
-                if (getOp.IsSynchronized)
-                    _getPool.Return(getOp);
                 else
-                    _getq.Enqueue(getOp);
-                
-                // We return immediately. The other thread will handle scheduling our continuation.
-                return;
+                {
+                    // Someone is fulfilling us right now. Abandon the search, but do
+                    // not swallow the op we just dequeued.
+                    if (getOp.IsSynchronized)
+                        OpPool<T>.Get.Return(getOp);
+                    else
+                        _getq.Enqueue(getOp);
+
+                    return MatchOutcome.Aborted;
+                }
             }
+
+            return MatchOutcome.Exhausted;
+        }
+        finally
+        {
+            // Must run on EVERY exit path, including both early returns above.
+            // Dropping a deferred op would silently delete one of our own pending
+            // choose branches, and the sync block would then block forever.
+            if (deferred != null)
+                foreach (var op in deferred) _getq.Enqueue(op);
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Receive
+    // -----------------------------------------------------------------------
+
     public void PublishReceive(SyncState state, int eventId, Action<T> resumeGet)
     {
-        // FAST PATH: Try to match without enqueueing ourselves
-        while (_putq.TryDequeue(out var putOp))
-        {
-            if (putOp.IsSynchronized) 
-            {
-                _putPool.Return(putOp);
-                continue;
-            }
+        if (TryMatchPut(state, eventId, resumeGet) != MatchOutcome.Exhausted)
+            return;
 
-            if (state.TryClaim())
-            {
-                if (putOp.TrySync())
-                {
-                    T capturedValue = putOp.Value;
-                    var putResume = putOp.ResumePut;
-
-                    state.MarkSynchronized(eventId);
-                    putOp.State.MarkSynchronized(putOp.EventId);
-
-                    var myResume = resumeGet;
-
-                    Scheduler.Dispatch(putResume);
-                    Scheduler.Dispatch(myResume, capturedValue);
-
-                    _putPool.Return(putOp);
-                    return;
-                }
-                else
-                {
-                    state.ResetClaim();
-                    if (putOp.IsSynchronized)
-                        _putPool.Return(putOp);
-                    else
-                    {
-                        _putq.Enqueue(putOp);
-                        System.Threading.Thread.Yield();
-                    }
-                }
-            }
-            else
-            {
-                if (putOp.IsSynchronized)
-                    _putPool.Return(putOp);
-                else
-                    _putq.Enqueue(putOp);
-                return;
-            }
-        }
-
-        // SLOW PATH: Enqueue and search again
-        var myOp = _getPool.Get();
+        var myOp = OpPool<T>.Get.Get();
         myOp.State = state;
         myOp.EventId = eventId;
         myOp.ResumeGet = resumeGet;
-
-        // Enqueue first to prevent the race condition where sender and receiver miss each other.
         _getq.Enqueue(myOp);
 
-        while (_putq.TryDequeue(out var putOp))
+        TryMatchPut(state, eventId, resumeGet);
+    }
+
+    private MatchOutcome TryMatchPut(SyncState state, int eventId, Action<T> resumeGet)
+    {
+        List<PutOp<T>>? deferred = null;
+        try
         {
-            if (putOp.IsSynchronized) 
+            while (_putq.TryDequeue(out var putOp))
             {
-                _putPool.Return(putOp);
-                continue;
-            }
-
-            if (state.TryClaim())
-            {
-                if (putOp.TrySync())
+                // See TryMatchGet: never pair a sync block with itself.
+                if (ReferenceEquals(putOp.State, state))
                 {
-                    T capturedValue = putOp.Value;
-                    var putResume = putOp.ResumePut;
-
-                    // Trigger NACKs for aborted choices in both the sender's and receiver's Sync groups.
-                    state.MarkSynchronized(eventId);
-                    putOp.State.MarkSynchronized(putOp.EventId);
-
-                    var myResume = resumeGet;
-
-                    Scheduler.Dispatch(putResume);
-                    Scheduler.Dispatch(myResume, capturedValue);
-
-                    _putPool.Return(putOp);
-                    return;
+                    (deferred ??= new List<PutOp<T>>()).Add(putOp);
+                    continue;
                 }
-                else
+
+                if (putOp.IsSynchronized)
                 {
+                    OpPool<T>.Put.Return(putOp);
+                    continue;
+                }
+
+                if (state.TryClaim())
+                {
+                    if (putOp.TrySync())
+                    {
+                        T capturedValue = putOp.Value;
+                        var putResume = putOp.ResumePut;
+                        var putState = putOp.State;
+                        int putEventId = putOp.EventId;
+
+                        state.MarkSynchronized(eventId);
+                        putState.MarkSynchronized(putEventId);
+
+                        OpPool<T>.Put.Return(putOp);
+
+                        Scheduler.Dispatch(putResume);
+                        Scheduler.Dispatch(resumeGet, capturedValue);
+                        return MatchOutcome.Matched;
+                    }
+
                     state.ResetClaim();
+
                     if (putOp.IsSynchronized)
-                        _putPool.Return(putOp);
+                    {
+                        OpPool<T>.Put.Return(putOp);
+                    }
                     else
                     {
                         _putq.Enqueue(putOp);
-                        
-                        // Yield to prevent livelock under heavy contention.
-                        System.Threading.Thread.Yield();
+                        Thread.Yield();
                     }
                 }
-            }
-            else
-            {
-                if (putOp.IsSynchronized)
-                    _putPool.Return(putOp);
                 else
-                    _putq.Enqueue(putOp);
-                return;
+                {
+                    if (putOp.IsSynchronized)
+                        OpPool<T>.Put.Return(putOp);
+                    else
+                        _putq.Enqueue(putOp);
+
+                    return MatchOutcome.Aborted;
+                }
             }
+
+            return MatchOutcome.Exhausted;
+        }
+        finally
+        {
+            if (deferred != null)
+                foreach (var op in deferred) _putq.Enqueue(op);
         }
     }
 }
