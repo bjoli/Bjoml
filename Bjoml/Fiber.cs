@@ -100,7 +100,7 @@ internal sealed class FiberStateMachineBox<TStateMachine> : IThreadPoolWorkItem
 // copied around; this reference is what actually persists.
 // ---------------------------------------------------------------------------
 
-public sealed class FiberCore<T> : Promise<T>
+public sealed class FiberCore<T> : Promise<T>, IThreadPoolWorkItem
 {
     [ThreadStatic] internal static FiberCore<T>? CurrentSpawning;
 
@@ -117,6 +117,20 @@ public sealed class FiberCore<T> : Promise<T>
     }
 
     private object? _box;
+    internal Action<FiberCore<T>>? _runner;
+    internal object? _spawnBody;
+    internal object? _spawnState;
+    internal object? _spawnInherited;
+
+    public FiberCore() { }
+
+    internal FiberCore(Action<FiberCore<T>> runner, object body, object? state, object? inherited)
+    {
+        _runner = runner;
+        _spawnBody = body;
+        _spawnState = state;
+        _spawnInherited = inherited;
+    }
 
     public void SetResult(T value) => TrySetResult(value);
     public void SetException(Exception e) => TrySetException(e);
@@ -147,6 +161,36 @@ public sealed class FiberCore<T> : Promise<T>
 
     /// <summary>The boxed resume, usable as a work item with no wrapper allocation.</summary>
     internal IThreadPoolWorkItem? WorkItem => _box as IThreadPoolWorkItem;
+
+    void IThreadPoolWorkItem.Execute()
+    {
+        var runner = _runner;
+        var inherited = _spawnInherited;
+
+        _runner = null;
+        _spawnInherited = null;
+
+        var prev = FiberContext.Current;
+        bool hasContextChange = !ReferenceEquals(prev, inherited);
+        if (hasContextChange) FiberContext.Current = inherited;
+
+        CurrentSpawning = this;
+        try
+        {
+            runner?.Invoke(this);
+        }
+        catch (Exception e)
+        {
+            TrySetException(e);
+        }
+        finally
+        {
+            _spawnBody = null;
+            _spawnState = null;
+            CurrentSpawning = null;
+            if (hasContextChange) FiberContext.Current = prev;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

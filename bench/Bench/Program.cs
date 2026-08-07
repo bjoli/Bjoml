@@ -108,7 +108,7 @@ public static class Program
         for (int i = 0; i < n; i++)
         {
             int v = i;
-            Bjo.Spawn(() => SendOne(ch, v));
+            Bjo.Spawn(static s => SendOne(s.ch, s.v), (ch, v));
         }
 
         long total = 0;

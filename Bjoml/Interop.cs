@@ -46,18 +46,40 @@ public static class Bjo
     public static Promise<T> Spawn<T>(Func<Fiber<T>> body)
     {
         var inherited = FiberContext.Current;
-        var handle = new FiberCore<T>();
-        Scheduler.Enqueue(SpawnWorkItem<T>.Rent(body, inherited, handle));
-        return handle;
+        var core = new FiberCore<T>(SpawnRunners<T>.FuncRunner, body, null, inherited);
+        Scheduler.Enqueue(core);
+        return core;
+    }
+
+    /// <summary>
+    /// Spawn a bjoroutine with state and a result. Enables zero-closure static lambdas.
+    /// </summary>
+    public static Promise<TResult> Spawn<TState, TResult>(Func<TState, Fiber<TResult>> body, TState state)
+    {
+        var inherited = FiberContext.Current;
+        var core = new FiberCore<TResult>(SpawnStateRunners<TState, TResult>.StateRunner, body, state, inherited);
+        Scheduler.Enqueue(core);
+        return core;
     }
 
     /// <summary>Spawn a bjoroutine with no useful result.</summary>
     public static Promise<Unit> Spawn(Func<Fiber> body)
     {
         var inherited = FiberContext.Current;
-        var handle = new FiberCore<Unit>();
-        Scheduler.Enqueue(SpawnWorkItem.Rent(body, inherited, handle));
-        return handle;
+        var core = new FiberCore<Unit>(SpawnUnitRunners.FuncRunner, body, null, inherited);
+        Scheduler.Enqueue(core);
+        return core;
+    }
+
+    /// <summary>
+    /// Spawn a bjoroutine with state and no useful result. Enables zero-closure static lambdas.
+    /// </summary>
+    public static Promise<Unit> Spawn<TState>(Func<TState, Fiber> body, TState state)
+    {
+        var inherited = FiberContext.Current;
+        var core = new FiberCore<Unit>(SpawnStateRunners<TState, Unit>.UnitStateRunner, body, state, inherited);
+        Scheduler.Enqueue(core);
+        return core;
     }
 
     // -----------------------------------------------------------------------
@@ -112,150 +134,43 @@ public static class Bjo
     }
 }
 
-internal sealed class SpawnWorkItem<T> : IThreadPoolWorkItem
+internal static class SpawnRunners<T>
 {
-    private const int MaxCached = 64;
-    [ThreadStatic] private static SpawnWorkItem<T>? _free;
-    [ThreadStatic] private static int _freeCount;
-
-    private SpawnWorkItem<T>? _next;
-    private Func<Fiber<T>> _body = null!;
-    private object? _inherited;
-    private FiberCore<T> _handle = null!;
-
-    public static SpawnWorkItem<T> Rent(Func<Fiber<T>> body, object? inherited, FiberCore<T> handle)
+    public static readonly Action<FiberCore<T>> FuncRunner = static core =>
     {
-        var item = _free;
-        if (item is null)
-        {
-            return new SpawnWorkItem<T>
-            {
-                _body = body,
-                _inherited = inherited,
-                _handle = handle
-            };
-        }
-
-        _free = item._next;
-        _freeCount--;
-        item._next = null;
-        item._body = body;
-        item._inherited = inherited;
-        item._handle = handle;
-        return item;
-    }
-
-    public void Execute()
-    {
-        var body = _body;
-        var inherited = _inherited;
-        var handle = _handle;
-
-        _body = null!;
-        _inherited = null;
-        _handle = null!;
-
-        if (_freeCount < MaxCached)
-        {
-            _next = _free;
-            _free = this;
-            _freeCount++;
-        }
-
-        var prev = FiberContext.Current;
-        FiberContext.Current = inherited;
-        FiberCore<T>.CurrentSpawning = handle;
-        try
-        {
-            var fiber = body();
-            if (!ReferenceEquals(fiber.Core, handle))
-            {
-                fiber.AsPromise().Forward(handle);
-            }
-        }
-        catch (Exception e)
-        {
-            handle.TrySetException(e);
-        }
-        finally
-        {
-            FiberCore<T>.CurrentSpawning = null;
-            FiberContext.Current = prev;
-        }
-    }
+        var func = (Func<Fiber<T>>)core._spawnBody!;
+        var fiber = func();
+        if (!ReferenceEquals(fiber.Core, core)) fiber.AsPromise().Forward(core);
+    };
 }
 
-internal sealed class SpawnWorkItem : IThreadPoolWorkItem
+internal static class SpawnUnitRunners
 {
-    private const int MaxCached = 64;
-    [ThreadStatic] private static SpawnWorkItem? _free;
-    [ThreadStatic] private static int _freeCount;
-
-    private SpawnWorkItem? _next;
-    private Func<Fiber> _body = null!;
-    private object? _inherited;
-    private FiberCore<Unit> _handle = null!;
-
-    public static SpawnWorkItem Rent(Func<Fiber> body, object? inherited, FiberCore<Unit> handle)
+    public static readonly Action<FiberCore<Unit>> FuncRunner = static core =>
     {
-        var item = _free;
-        if (item is null)
-        {
-            return new SpawnWorkItem
-            {
-                _body = body,
-                _inherited = inherited,
-                _handle = handle
-            };
-        }
+        var func = (Func<Fiber>)core._spawnBody!;
+        var fiber = func();
+        if (!ReferenceEquals(fiber.Core, core)) fiber.AsPromise().Forward(core);
+    };
+}
 
-        _free = item._next;
-        _freeCount--;
-        item._next = null;
-        item._body = body;
-        item._inherited = inherited;
-        item._handle = handle;
-        return item;
-    }
-
-    public void Execute()
+internal static class SpawnStateRunners<TState, TResult>
+{
+    public static readonly Action<FiberCore<TResult>> StateRunner = static core =>
     {
-        var body = _body;
-        var inherited = _inherited;
-        var handle = _handle;
+        var func = (Func<TState, Fiber<TResult>>)core._spawnBody!;
+        var state = (TState)core._spawnState!;
+        var fiber = func(state);
+        if (!ReferenceEquals(fiber.Core, core)) fiber.AsPromise().Forward(core);
+    };
 
-        _body = null!;
-        _inherited = null;
-        _handle = null!;
-
-        if (_freeCount < MaxCached)
-        {
-            _next = _free;
-            _free = this;
-            _freeCount++;
-        }
-
-        var prev = FiberContext.Current;
-        FiberContext.Current = inherited;
-        FiberCore<Unit>.CurrentSpawning = handle;
-        try
-        {
-            var fiber = body();
-            if (!ReferenceEquals(fiber.Core, handle))
-            {
-                fiber.AsPromise().Forward(handle);
-            }
-        }
-        catch (Exception e)
-        {
-            handle.TrySetException(e);
-        }
-        finally
-        {
-            FiberCore<Unit>.CurrentSpawning = null;
-            FiberContext.Current = prev;
-        }
-    }
+    public static readonly Action<FiberCore<Unit>> UnitStateRunner = static core =>
+    {
+        var func = (Func<TState, Fiber>)core._spawnBody!;
+        var state = (TState)core._spawnState!;
+        var fiber = func(state);
+        if (!ReferenceEquals(fiber.Core, core)) fiber.AsPromise().Forward(core);
+    };
 }
 
 public static class TaskInterop
