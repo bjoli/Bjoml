@@ -20,7 +20,19 @@ using System.Runtime.CompilerServices;
 
 namespace Bjoml;
 
-public class Channel<T> : IEvent<T>
+/// <summary>
+/// Something that can be told "one or more of your parked entries just died", so that
+/// a committing sync block can drive cleanup of the channels its branches published to.
+///
+/// Non-generic on purpose: <see cref="SyncState"/> knows nothing about the element type
+/// of the channels its branches touched.
+/// </summary>
+internal interface IDeadEntrySink
+{
+    void NoteDeadEntry();
+}
+
+public class Channel<T> : IEvent<T>, IDeadEntrySink
 {
     private readonly object _lock = new();
     private PutOp<T>? _giversHead;
@@ -80,6 +92,62 @@ public class Channel<T> : IEvent<T>
                 }
                 return count;
             }
+        }
+    }
+
+    /// <summary>
+    /// Parked receive entries, counted WITHOUT cleaning first. Test-only.
+    ///
+    /// <see cref="PendingReceiveCount"/> calls <c>CleanTakers</c> before counting, so it
+    /// can never observe a leak — reading it performs exactly the reclamation that a B7
+    /// test is trying to prove happens on its own, and the test passes whether or not
+    /// the bug is fixed. Proving entries do not accumulate requires the raw list.
+    /// </summary>
+    internal int RawPendingReceiveCount
+    {
+        get
+        {
+            lock (_lock)
+            {
+                int count = 0;
+                for (var curr = _takersHead; curr != null; curr = curr.Next) count++;
+                return count;
+            }
+        }
+    }
+
+    /// <summary>Parked send entries, counted without cleaning first. Test-only.</summary>
+    internal int RawPendingSendCount
+    {
+        get
+        {
+            lock (_lock)
+            {
+                int count = 0;
+                for (var curr = _giversHead; curr != null; curr = curr.Next) count++;
+                return count;
+            }
+        }
+    }
+
+    /// <summary>
+    /// A block that parked here has committed, so at least one of our entries is now
+    /// dead. Unlink and recycle every synchronized entry (B7).
+    ///
+    /// Both directions are cleaned because registration records the CHANNEL, not which
+    /// side the branch parked on; a choose may well have offered both. Both lists are
+    /// short in practice, and the walk only happens on commit, never on the fast path.
+    ///
+    /// MUST NOT be called while holding this channel's lock: it is reached from
+    /// <see cref="SyncState.MarkSynchronized"/>, which deliberately releases its own
+    /// lock first. Re-entering here mid-traversal would corrupt the caller's iteration.
+    /// </summary>
+    void IDeadEntrySink.NoteDeadEntry()
+    {
+        lock (_lock)
+        {
+            CleanTakers();
+            CleanGivers();
         }
     }
 
@@ -226,7 +294,11 @@ public class Channel<T> : IEvent<T>
 
             if (!matched)
             {
-                if (state.IsSynchronized) return;
+                // Register before parking so the committing side can come back and
+                // reclaim this op if our branch loses. A false return means the block
+                // already committed, so parking now would strand an entry that nothing
+                // is coming back for.
+                if (!state.TryRegisterSink(this)) return;
 
                 var myOp = PutOp<T>.Rent(state, eventId, value, resumePut);
                 if (_giversTail == null)
@@ -353,7 +425,8 @@ public class Channel<T> : IEvent<T>
 
             if (!matched)
             {
-                if (state.IsSynchronized) return;
+                // See PublishSend: register before parking so committing can reclaim us.
+                if (!state.TryRegisterSink(this)) return;
 
                 var myOp = GetOp<T>.Rent(state, eventId, resumeGet);
                 if (_takersTail == null)

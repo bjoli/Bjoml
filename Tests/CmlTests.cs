@@ -29,8 +29,11 @@ public static class CmlTests
         Run("Always wins a choose", AlwaysWinsChoose);
         Run("Always is not dropped when published after a parked branch", AlwaysAfterParkedBranch);
 
-        Section("B7 - stale operations in channel queues (KNOWN ISSUE, not yet fixed)");
-        Run("characterise: losing branches accumulate in an idle channel", StaleOpsAccumulate);
+        Section("B7 - losing branches must stay bounded, live ones must survive");
+        Run("losers do not accumulate in an idle channel", StaleOpsDoNotAccumulate);
+        Run("a channel never touched again is still cleaned", IdleChannelCleanedWithoutTraffic);
+        Run("a live parked receive is NOT cleaned away", LiveReceiveSurvivesCleanup);
+        Run("withNack losers stay bounded too", WithNackLosersBounded);
 
         Section("Baseline combinator behaviour");
         Run("wrap maps the value", WrapMapsValue);
@@ -271,22 +274,14 @@ public static class CmlTests
     // -----------------------------------------------------------------------
 
     /// <summary>
-    /// CHARACTERISATION TEST — asserts the CURRENT, BUGGY behaviour on purpose.
+    /// The core B7 assertion: a channel offered in a choose that keeps LOSING must not
+    /// accumulate the dead operations of those losing branches.
     ///
-    /// When a choose branch loses, its PutOp/GetOp stays in the channel queue. It is
-    /// only reclaimed if some LATER operation happens to dequeue it and notice it is
-    /// synchronized. So a channel that is offered in a choose but never actually
-    /// communicated on grows without bound, and the operation pool never gets its
-    /// objects back.
-    ///
-    /// Fixing this needs O(1) removable queue entries (an intrusive linked list) plus
-    /// SyncState tracking its published ops so it can unlink the losers. That is a
-    /// rewrite of the channel core, so it is deliberately NOT done here.
-    ///
-    /// When someone does fix it, this test will fail — which is the point. Change it
-    /// to assert the queue stays bounded.
+    /// Note this reads <c>RawPendingReceiveCount</c>, not <c>PendingReceiveCount</c>.
+    /// The latter cleans before counting, so it reports 0 whether or not the bug is
+    /// fixed and cannot witness the leak at all.
     /// </summary>
-    private static void StaleOpsAccumulate()
+    private static void StaleOpsDoNotAccumulate()
     {
         const int iterations = 500;
 
@@ -307,10 +302,112 @@ public static class CmlTests
             Await(done, $"iteration {i}", 2000);
         }
 
-        int stranded = idle.PendingReceiveCount;
+        int stranded = idle.RawPendingReceiveCount;
 
+        // Not asserting exactly 0: a commit races with the losing branch still being
+        // published, so the last iteration's loser may legitimately still be in flight.
+        // The property that matters is that it does not GROW with the iteration count.
+        Assert(stranded <= 2,
+            $"Expected losing branches to be reclaimed, but {stranded} of {iterations} are stranded");
+    }
+
+    /// <summary>
+    /// The case that makes B7 nasty, and the reason cleanup must be driven from the
+    /// committing side: a channel that is offered once and then never sees traffic
+    /// again. Anything triggered by channel activity cannot reach it, because there is
+    /// no subsequent activity.
+    /// </summary>
+    private static void IdleChannelCleanedWithoutTraffic()
+    {
+        var busy = new Channel<int>();
+        var idle = new Channel<int>();
+        var done = new ManualResetEventSlim(false);
+
+        Cml.Sync(
+            Cml.Choose(
+                new ChannelReceiveEvent<int>(busy),
+                new ChannelReceiveEvent<int>(idle)),
+            _ => done.Set());
+
+        Cml.Sync(new ChannelSendEvent<int>(busy, 1), _ => { });
+        Await(done, "the busy branch to win", 2000);
+
+        // `idle` is now never touched again. Give the commit-driven cleanup a moment,
+        // then confirm the loser was reclaimed anyway.
+        Thread.Sleep(100);
+
+        int stranded = idle.RawPendingReceiveCount;
         Assert(stranded == 0,
-            $"Expected 0 stale ops after cleaning, but got {stranded}");
+            $"A channel with no further traffic kept {stranded} dead entries");
+    }
+
+    /// <summary>
+    /// The safety side of the fix, and the one that would catch an over-eager cleanup:
+    /// an operation whose block has NOT committed is still live and must survive.
+    /// Reclaiming it would lose a genuine waiter and hang the receiver forever.
+    /// </summary>
+    private static void LiveReceiveSurvivesCleanup()
+    {
+        var live = new Channel<int>();
+        var busy = new Channel<int>();
+        var received = new ManualResetEventSlim(false);
+        int got = -1;
+
+        // A plain receive that nobody will satisfy yet. This must stay parked.
+        Cml.Sync(new ChannelReceiveEvent<int>(live), v => { got = v; received.Set(); });
+
+        // Churn unrelated chooses so cleanup runs repeatedly against `live`.
+        for (int i = 0; i < 50; i++)
+        {
+            var done = new ManualResetEventSlim(false);
+            Cml.Sync(
+                Cml.Choose(
+                    new ChannelReceiveEvent<int>(busy),
+                    new ChannelReceiveEvent<int>(live)),
+                _ => done.Set());
+
+            Cml.Sync(new ChannelSendEvent<int>(busy, i), _ => { });
+            Await(done, $"iteration {i}", 2000);
+        }
+
+        // The original live receive must still be there and must still work.
+        Cml.Sync(new ChannelSendEvent<int>(live, 99), _ => { });
+        Await(received, "the still-parked receive to be satisfied", 2000);
+        AssertEqual(99, got, "value delivered to the surviving receive");
+    }
+
+    /// <summary>
+    /// withNack builds a deeper event tree, so the losing branch is published through
+    /// a different path. Confirm registration still happens there.
+    /// </summary>
+    private static void WithNackLosersBounded()
+    {
+        const int iterations = 200;
+
+        var busy = new Channel<int>();
+        var idle = new Channel<int>();
+
+        for (int i = 0; i < iterations; i++)
+        {
+            var done = new ManualResetEventSlim(false);
+
+            Cml.Sync(
+                Cml.Choose(
+                    new ChannelReceiveEvent<int>(busy),
+                    Cml.WithNack(nack =>
+                    {
+                        Cml.Sync(nack, _ => { });
+                        return new ChannelReceiveEvent<int>(idle);
+                    })),
+                _ => done.Set());
+
+            Cml.Sync(new ChannelSendEvent<int>(busy, i), _ => { });
+            Await(done, $"iteration {i}", 2000);
+        }
+
+        int stranded = idle.RawPendingReceiveCount;
+        Assert(stranded <= 2,
+            $"withNack losing branches stranded {stranded} of {iterations}");
     }
 
     // -----------------------------------------------------------------------

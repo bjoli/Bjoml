@@ -16,6 +16,7 @@
 // along with BjoML.  If not, see <https://www.gnu.org/licenses/>.
 
 using System;
+using System.Collections.Generic;
 using System.Threading;
 
 namespace Bjoml;
@@ -73,6 +74,27 @@ public class SyncState
     // Allocated on demand only when withNack is actually used.
     private NackNode? _nacks;
 
+    // Every channel this block parked an operation in, so that committing can drive
+    // cleanup there (B7). A losing choose branch leaves its op in the channel's list,
+    // and that op is otherwise only reclaimed if some LATER operation happens to walk
+    // past it -- which never happens on a channel that is offered in a choose and then
+    // goes quiet. Cleanup therefore has to be driven from the COMMITTING side: the
+    // committing block is the only party that knows those branches just died.
+    //
+    // We deliberately store the CHANNEL, not the operation. A matcher can unlink and
+    // recycle an op at any moment, so a stored op reference may already have been
+    // handed to somebody else by the time we look at it. A redundant clean costs one
+    // short list walk; a missed one leaks forever.
+    //
+    // ONE field, holding either a single IDeadEntrySink or a List of them.
+    //
+    // SyncState is allocated once per Cml.Sync, so every reference field added here
+    // lands directly in the per-op allocation figure: measured on Select/Choose, two
+    // fields cost +16 B/op and three cost +24, while the overflow List itself never
+    // showed up at all. Packing into one field is therefore worth the type test —
+    // it is the field count that is expensive, not the rare list.
+    private object? _sinks;
+
     /// <summary>The next event index to be minted.</summary>
     public int CurrentEventId => Volatile.Read(ref _eventIdCounter);
 
@@ -98,6 +120,43 @@ public class SyncState
     public void ResetClaim() => Volatile.Write(ref _value, W);
 
     public bool IsSynchronized => Volatile.Read(ref _value) == S;
+
+    /// <summary>
+    /// Note that this block is about to park an operation in <paramref name="sink"/>,
+    /// so that committing can come back and clean it up.
+    ///
+    /// Returns false if the block has ALREADY committed, in which case the caller must
+    /// NOT park: nothing is coming back to reclaim it. This subsumes the bare
+    /// <see cref="IsSynchronized"/> check it replaces, and closes the race in it —
+    /// here the test and the registration happen under one lock, so a commit cannot
+    /// slip between them and strand the op we are about to enqueue.
+    /// </summary>
+    internal bool TryRegisterSink(IDeadEntrySink sink)
+    {
+        lock (this)
+        {
+            if (Volatile.Read(ref _value) == S) return false;
+
+            if (_sinks == null)
+            {
+                _sinks = sink;
+            }
+            else if (_sinks is List<IDeadEntrySink> list)
+            {
+                // No dedupe scan here: a redundant clean is a short walk, and paying an
+                // O(n) scan on every park to avoid it would be the worse trade.
+                list.Add(sink);
+            }
+            else if (!ReferenceEquals(_sinks, sink))
+            {
+                // Second distinct channel; promote to a list. Dedupes the very common
+                // `choose [recv ch; send ch]` shape for free via the reference check.
+                _sinks = new List<IDeadEntrySink> { (IDeadEntrySink)_sinks, sink };
+            }
+
+            return true;
+        }
+    }
 
     /// <summary>
     /// Atomic W -&gt; C -&gt; S for events that commit on their own initiative rather
@@ -141,8 +200,13 @@ public class SyncState
         Volatile.Write(ref _value, S);
 
         NackNode? toFireHead = null;
+        object? sinks;
+
         lock (this)
         {
+            sinks = _sinks;
+            _sinks = null;
+
             var curr = _nacks;
             _nacks = null;
             while (curr != null)
@@ -156,6 +220,15 @@ public class SyncState
                 curr = next;
             }
         }
+
+        // Outside the lock, and this is load-bearing. Cleanup takes the channel's lock,
+        // while the parking path takes the channel lock and then THIS lock (via
+        // TryRegisterSink). Holding this lock while reaching for a channel lock would
+        // invert that order and deadlock. Releasing first means the only nesting in the
+        // system stays channel -> state, with no cycle.
+        if (sinks is IDeadEntrySink one) one.NoteDeadEntry();
+        else if (sinks is List<IDeadEntrySink> many)
+            foreach (var s in many) s.NoteDeadEntry();
 
         while (toFireHead != null)
         {

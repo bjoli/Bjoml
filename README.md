@@ -75,16 +75,6 @@ Full numbers, methodology and a before/after comparison are in
   been verified to fail when its fix is reverted. Run with
   `dotnet run -c Release --project Tests`.
 
-## TODO
-
-**B7: stale operations accumulate in channel queues.** A losing `choose` branch
-leaves its operation in the channel queue, reclaimed only if some later operation
-happens to dequeue it. A channel offered in a `choose` but never communicated on
-grows without bound, and the operation pool never gets those objects back. Fixing it
-needs O(1) removable queue entries (an intrusive linked list) plus `SyncState`
-tracking published ops so it can unlink losers. There is a characterisation test that
-will fail, deliberately, once this is fixed.
-
 ## License
 
 Since I learned of cml from Andy Wingo, and his fantastic guile-fibers, this is licensed under the same license. This is not a derived work, except for possibly the channels which I had a look at long before actually writing anything myself. Most of the algorithms come directly from John Reppy's papers. 

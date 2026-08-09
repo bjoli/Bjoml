@@ -156,6 +156,10 @@ the corresponding fix is reverted.
 - **B5** — `Scheduler.Start()` raced and could NRE on a partially-published array.
   Gone with the dedicated workers.
 - **B6** — no work stealing. Gone with the dedicated workers.
+- **B7** — a losing `choose` branch left its `PutOp`/`GetOp` parked in the channel,
+  reclaimed only if some *later* operation happened to walk past it. A channel offered
+  in a `choose` that then went quiet grew without bound: measured at exactly one
+  stranded op per losing branch, 500 out of 500. See below.
 - **B8** — `MarkSynchronized` was a public method that would stomp another thread's
   claim. Precondition now documented; self-committing events go through `TryCommit`.
 - **B9** — the `ValueTask` path flowed `ExecutionContext`. Flag now stripped.
@@ -168,26 +172,52 @@ compile (generic inference through an async lambda) and leaked its
 `CancellationTokenSource` whenever the branch **won**; and `PromiseEvent` registered
 waiters that were never removed when their branch lost.
 
+### B7 in detail — cleanup must be driven from the committing side
+
+The half of the fix that reads as a rewrite was already done, for unrelated reasons:
+the channel had by then moved from `ConcurrentQueue` to intrusive lists under a
+per-channel lock, and already had `CleanTakers`/`CleanGivers` to unlink and recycle
+synchronized entries. Those were only ever called from the test-only `Pending*Count`
+properties, so nothing in production ever ran them.
+
+What was missing was the trigger. The channels that leak are precisely the *idle*
+ones, so no scheme driven by channel activity can ever reach them — there is no
+subsequent activity. The committing block is the only party that knows those branches
+just died, so it has to drive the cleanup:
+
+- `SyncState.TryRegisterSink` records each channel a block parks in, and returns false
+  if the block has already committed, in which case the caller must not park. This
+  replaces a bare `IsSynchronized` check and closes the race in it: test and
+  registration now happen under one lock.
+- `MarkSynchronized` calls `NoteDeadEntry()` on each registered channel.
+
+Three things are load-bearing:
+
+- **Store the channel, not the operation.** A matcher can unlink and recycle an op at
+  any moment, so a stored op reference may already belong to somebody else by the time
+  we look at it. A redundant clean is a short walk; a missed one leaks forever.
+- **Clean outside the state lock.** Parking takes the channel lock and then the state
+  lock (via `TryRegisterSink`). Holding the state lock while reaching for a channel
+  lock would invert that order and deadlock, so `MarkSynchronized` collects the sinks
+  under its lock, releases, and only then cleans. The one nesting in the system stays
+  channel → state, with no cycle.
+- **One field, not three.** `SyncState` is allocated per `Cml.Sync`, so each reference
+  field added to it lands straight in the per-op allocation figure. Separate slots plus
+  an overflow list measured +16 and +24 B/op on Select/Choose; packing into a single
+  `object?` that holds either the sink or a `List` costs +8. The rare overflow list
+  never showed up at all — it is the field count that is expensive.
+
+A note on the old test. `characterise: losing branches accumulate in an idle channel`
+could never have detected this: it read `PendingReceiveCount`, which calls
+`CleanTakers()` *before* counting, so reading it performed the very reclamation the
+test was meant to prove happened on its own. It passed with the bug present. The
+replacement tests read `RawPendingReceiveCount`, which does not clean, and have been
+verified to fail with the fix reverted — 500 of 500 stranded, 200 of 200 for the
+`withNack` shape.
+
 ---
 
 ## 5. Known issues
-
-### B7 — stale operations accumulate in channel queues (NOT FIXED)
-
-When a `choose` branch loses, its `PutOp`/`GetOp` stays in the channel queue. It is
-reclaimed only if some *later* operation happens to dequeue it and notice it is
-synchronized. A channel that is offered in a `choose` but never actually communicated
-on therefore grows without bound, and the operation pool never gets those objects
-back.
-
-Measured: exactly one stranded op per losing branch. See the characterisation test
-`characterise: losing branches accumulate in an idle channel`, which asserts the
-current buggy behaviour on purpose and will fail — deliberately — when this is fixed.
-
-The fix needs O(1) removable queue entries (an intrusive doubly-linked list under a
-lock) plus `SyncState` tracking its published ops so `MarkSynchronized` can unlink
-the losers. That is a rewrite of the channel core and a likely perf swing in both
-directions, so it was left out of this pass rather than rushed.
 
 ### Channel ordering is not guaranteed
 
