@@ -21,19 +21,7 @@ using System.Threading;
 
 namespace Bjoml;
 
-/// <summary>
-/// Something that can be told "one or more of your parked entries just died", so that
-/// a committing sync block can drive cleanup of the channels its branches published to.
-///
-/// Non-generic on purpose: <see cref="SyncState"/> knows nothing about the element type
-/// of the channels its branches touched.
-/// </summary>
-internal interface IDeadEntrySink
-{
-    void NoteDeadEntry();
-}
-
-public class Channel<T> : IEvent<T>, IDeadEntrySink
+public class Channel<T> : IEvent<T>
 {
     private readonly object _lock = new();
     private PutOp<T>? _giversHead;
@@ -131,33 +119,44 @@ public class Channel<T> : IEvent<T>, IDeadEntrySink
         }
     }
 
+    // ---- B7: bounding the dead set ------------------------------------------
+    //
+    // A losing choose branch leaves its op parked here. Otherwise it is reclaimed only
+    // if some LATER operation happens to walk past it, so a channel offered in a choose
+    // that then goes quiet grows without bound.
+    //
+    // The trigger is a park counter, not the committing block. Every dead entry is
+    // necessarily preceded by a PARK in this same channel, so counting parks bounds the
+    // dead set without anyone having to remember which channels a block touched. The
+    // count is plain, non-atomic, and read under _lock, which the park sites already
+    // hold — so the fast path pays one increment and nothing else.
+    //
+    // The alternative, having SyncState record each channel and drive cleanup on
+    // commit, gives a strictly stronger guarantee (zero stranded, not merely bounded)
+    // and was measured at 36 ns/op on Select/Choose. See docs/design.md; do not
+    // reintroduce it without re-measuring.
+    private int _parksSinceSweep;
+    private int _sweepThreshold = MinSweepThreshold;
+
+    private const int MinSweepThreshold = 32;
+
     /// <summary>
-    /// A block that parked here has committed, so at least one of our entries is now
-    /// dead. Unlink and recycle every synchronized entry (B7).
-    ///
-    /// Both directions are cleaned because registration records the CHANNEL, not which
-    /// side the branch parked on; a choose may well have offered both. Both lists are
-    /// short in practice, and the walk only happens on commit, never on the fast path.
-    ///
-    /// MUST NOT be called while holding this channel's lock: it is reached from
-    /// <see cref="SyncState.MarkSynchronized"/>, which deliberately releases its own
-    /// lock first. Re-entering here mid-traversal would corrupt the caller's iteration.
+    /// Called from the park sites with <c>_lock</c> already held. Sweeps once parks
+    /// since the last sweep reach a threshold that scales with the live set, which
+    /// amortises the O(n) walk to O(1) per park.
     /// </summary>
-    void IDeadEntrySink.NoteDeadEntry()
+    private void NotePark()
     {
-        // Cleaned immediately rather than amortised behind a dead-entry threshold.
-        //
-        // Thresholding was tried and rejected. It only bounds growth at the threshold
-        // instead of driving it to zero — an abandoned channel keeps its loser forever,
-        // and 500 losing branches left 20 stranded — and it bought just 173 -> 158 ns/op
-        // on Select/Choose. That is a poor price for giving up the zero-stranded
-        // guarantee, because the remaining cost is not this walk at all: it is the extra
-        // lock TryRegisterSink takes on every park. See SyncState.
-        lock (_lock)
-        {
-            CleanTakers();
-            CleanGivers();
-        }
+        if (++_parksSinceSweep < _sweepThreshold) return;
+
+        _parksSinceSweep = 0;
+
+        int live = CleanTakers() + CleanGivers();
+
+        // Next sweep only once the dead set could again rival the live set. Without
+        // this a channel with many genuine waiters would rescan them on every 32nd
+        // park and never reclaim anything.
+        _sweepThreshold = Math.Max(MinSweepThreshold, live * 2);
     }
 
     /// <summary>Unlink and recycle synchronized takers. Returns the surviving count.</summary>
@@ -311,11 +310,8 @@ public class Channel<T> : IEvent<T>, IDeadEntrySink
 
             if (!matched)
             {
-                // Register before parking so the committing side can come back and
-                // reclaim this op if our branch loses. A false return means the block
-                // already committed, so parking now would strand an entry that nothing
-                // is coming back for.
-                if (!state.TryRegisterSink(this)) return;
+                if (state.IsSynchronized) return;
+                NotePark();
 
                 var myOp = PutOp<T>.Rent(state, eventId, value, resumePut);
                 if (_giversTail == null)
@@ -442,8 +438,8 @@ public class Channel<T> : IEvent<T>, IDeadEntrySink
 
             if (!matched)
             {
-                // See PublishSend: register before parking so committing can reclaim us.
-                if (!state.TryRegisterSink(this)) return;
+                if (state.IsSynchronized) return;
+                NotePark();
 
                 var myOp = GetOp<T>.Rent(state, eventId, resumeGet);
                 if (_takersTail == null)

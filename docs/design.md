@@ -159,7 +159,8 @@ the corresponding fix is reverted.
 - **B7** — a losing `choose` branch left its `PutOp`/`GetOp` parked in the channel,
   reclaimed only if some *later* operation happened to walk past it. A channel offered
   in a `choose` that then went quiet grew without bound: measured at exactly one
-  stranded op per losing branch, 500 out of 500. See below.
+  stranded op per losing branch, 500 out of 500. Now bounded rather than driven to
+  zero, by a park counter on the channel, at no measurable cost. See below.
 - **B8** — `MarkSynchronized` was a public method that would stomp another thread's
   claim. Precondition now documented; self-committing events go through `TryCommit`.
 - **B9** — the `ValueTask` path flowed `ExecutionContext`. Flag now stripped.
@@ -172,7 +173,7 @@ compile (generic inference through an async lambda) and leaked its
 `CancellationTokenSource` whenever the branch **won**; and `PromiseEvent` registered
 waiters that were never removed when their branch lost.
 
-### B7 in detail — cleanup must be driven from the committing side
+### B7 in detail — count parks, not commits
 
 The half of the fix that reads as a rewrite was already done, for unrelated reasons:
 the channel had by then moved from `ConcurrentQueue` to intrusive lists under a
@@ -180,40 +181,60 @@ per-channel lock, and already had `CleanTakers`/`CleanGivers` to unlink and recy
 synchronized entries. Those were only ever called from the test-only `Pending*Count`
 properties, so nothing in production ever ran them.
 
-What was missing was the trigger. The channels that leak are precisely the *idle*
-ones, so no scheme driven by channel activity can ever reach them — there is no
-subsequent activity. The committing block is the only party that knows those branches
-just died, so it has to drive the cleanup:
+All that was missing was a trigger, and the cheap one is a **park counter on the
+channel**. Every dead entry is necessarily preceded by a park in that same channel, so
+counting parks bounds the dead set. `Channel<T>.NotePark` is called from the two park
+sites with `_lock` already held, and sweeps once parks since the last sweep reach
+`max(32, live * 2)` — which amortises the O(n) walk to O(1) per park. The fast path
+pays one non-atomic increment.
 
-- `SyncState.TryRegisterSink` records each channel a block parks in, and returns false
-  if the block has already committed, in which case the caller must not park. This
-  replaces a bare `IsSynchronized` check and closes the race in it: test and
-  registration now happen under one lock.
-- `MarkSynchronized` calls `NoteDeadEntry()` on each registered channel.
+**The guarantee is bounded, not zero.** A channel offered in exactly one choose and
+then abandoned never parks again, so its single loser stays put. That is one entry per
+abandoned channel, collectable with the channel itself. B7 was *unbounded* growth;
+bounded is the fix. `Tests/CmlTests.cs` asserts this the only way it honestly can, by
+checking that the residue does not grow with the workload: 500 and 4000 iterations
+must leave the same small number stranded, and with the sweep disabled 4000 iterations
+strand all 4000.
 
-Three things are load-bearing:
+#### The expensive version, and why it is not here
+
+The obvious design is to have the committing side drive cleanup: `SyncState` records
+every channel a block parks in, and `MarkSynchronized` cleans each. It gives a strictly
+stronger guarantee — zero stranded, including for the abandoned channel — and it was
+implemented, measured, and removed. It cost **36 ns/op** on Select/Choose, roughly a
+quarter of the whole operation.
+
+Subtractive measurement, `bench/Diag --mode select --reps 25`, medians:
+
+    baseline, no cleanup at all                      135 ns/op   40 B/op
+    extra SyncState fields present, no registration  148         56
+    registration, its lock removed                   167         56
+    registration, cleanup body disabled              170         56
+    full commit-driven version                       171         56
+    park counter (current)                           132         40
+
+Read that table before optimising anything here. **The lock is 4 ns and the cleanup
+walk is 1 ns** — both were the author's stated suspects and both are noise, exactly as
+in the `MarkSynchronized`/`NextEventId` investigation recorded above. The cost is the
+registration machinery itself: two more reference fields on a per-`Cml.Sync`
+allocation, the stores into them, and the interface dispatch to reach the channel.
+
+Note also that the park counter is *faster than not fixing B7 at all* (132 against
+135), because sweeping keeps the intrusive lists short and the matching loop therefore
+walks fewer dead nodes.
+
+Two hazards worth keeping, if anyone reinstates a commit-driven scheme:
 
 - **Store the channel, not the operation.** A matcher can unlink and recycle an op at
-  any moment, so a stored op reference may already belong to somebody else by the time
-  we look at it. A redundant clean is a short walk; a missed one leaks forever.
+  any moment, so a stored op reference may already belong to somebody else.
 - **Clean outside the state lock.** Parking takes the channel lock and then the state
-  lock (via `TryRegisterSink`). Holding the state lock while reaching for a channel
-  lock would invert that order and deadlock, so `MarkSynchronized` collects the sinks
-  under its lock, releases, and only then cleans. The one nesting in the system stays
-  channel → state, with no cycle.
-- **One field, not three.** `SyncState` is allocated per `Cml.Sync`, so each reference
-  field added to it lands straight in the per-op allocation figure. Separate slots plus
-  an overflow list measured +16 and +24 B/op on Select/Choose; packing into a single
-  `object?` that holds either the sink or a `List` costs +8. The rare overflow list
-  never showed up at all — it is the field count that is expensive.
+  lock, so cleaning while holding the state lock inverts that order and deadlocks.
 
 A note on the old test. `characterise: losing branches accumulate in an idle channel`
-could never have detected this: it read `PendingReceiveCount`, which calls
+could never have detected any of this: it read `PendingReceiveCount`, which calls
 `CleanTakers()` *before* counting, so reading it performed the very reclamation the
-test was meant to prove happened on its own. It passed with the bug present. The
-replacement tests read `RawPendingReceiveCount`, which does not clean, and have been
-verified to fail with the fix reverted — 500 of 500 stranded, 200 of 200 for the
-`withNack` shape.
+test was meant to prove happened on its own. It passed with the bug fully present. The
+replacement tests read `RawPendingReceiveCount`, which does not clean.
 
 ---
 

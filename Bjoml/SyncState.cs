@@ -16,7 +16,6 @@
 // along with BjoML.  If not, see <https://www.gnu.org/licenses/>.
 
 using System;
-using System.Collections.Generic;
 using System.Threading;
 
 namespace Bjoml;
@@ -74,34 +73,11 @@ public class SyncState
     // Allocated on demand only when withNack is actually used.
     private NackNode? _nacks;
 
-    // Every channel this block parked an operation in, so that committing can drive
-    // cleanup there (B7). A losing choose branch leaves its op in the channel's list,
-    // and that op is otherwise only reclaimed if some LATER operation happens to walk
-    // past it -- which never happens on a channel that is offered in a choose and then
-    // goes quiet. Cleanup therefore has to be driven from the COMMITTING side: the
-    // committing block is the only party that knows those branches just died.
-    //
-    // We deliberately store the CHANNEL, not the operation. A matcher can unlink and
-    // recycle an op at any moment, so a stored op reference may already have been
-    // handed to somebody else by the time we look at it. A redundant clean costs one
-    // short list walk; a missed one leaks forever.
-    //
-    // Two inline slots, the second doubling as the overflow list for three or more.
-    //
-    // SyncState is allocated once per Cml.Sync, so every reference field added here
-    // lands in the per-op allocation figure at 8 B/op each. That argues for packing
-    // into as few fields as possible — but a single field forces a List as soon as a
-    // block parks in TWO channels, which is exactly what an ordinary two-way choose
-    // does. Warm, that List fires on most commits and costs 88 B/op and ~80 ns:
-    //
-    //   Select/Choose, median of 9 reps, steady state
-    //     baseline, no cleanup tracking     130 ns/op    40 B/op
-    //     one packed field (List fires)     213 ns/op   136 B/op
-    //
-    // So two slots. A two-way choose is the common shape and must not allocate; three
-    // or more is rare enough to pay for a List.
-    private IDeadEntrySink? _sink0;
-    private object? _sink1OrRest;   // IDeadEntrySink, or List<IDeadEntrySink> for 3+
+    // B7 cleanup is deliberately NOT tracked here. SyncState used to remember every
+    // channel a block parked in so that committing could drive cleanup, and that cost
+    // 36 ns/op on Select/Choose — see the B7 section of docs/design.md. The trigger
+    // lives in Channel<T> instead, where a park is already visible under a lock that
+    // is already held.
 
     /// <summary>The next event index to be minted.</summary>
     public int CurrentEventId => Volatile.Read(ref _eventIdCounter);
@@ -128,38 +104,6 @@ public class SyncState
     public void ResetClaim() => Volatile.Write(ref _value, W);
 
     public bool IsSynchronized => Volatile.Read(ref _value) == S;
-
-    /// <summary>
-    /// Note that this block is about to park an operation in <paramref name="sink"/>,
-    /// so that committing can come back and clean it up.
-    ///
-    /// Returns false if the block has ALREADY committed, in which case the caller must
-    /// NOT park: nothing is coming back to reclaim it. This subsumes the bare
-    /// <see cref="IsSynchronized"/> check it replaces, and closes the race in it —
-    /// here the test and the registration happen under one lock, so a commit cannot
-    /// slip between them and strand the op we are about to enqueue.
-    /// </summary>
-    internal bool TryRegisterSink(IDeadEntrySink sink)
-    {
-        lock (this)
-        {
-            if (Volatile.Read(ref _value) == S) return false;
-
-            // The reference checks also dedupe the common `choose [recv ch; send ch]`
-            // shape for free. Only the two inline slots are checked; scanning the
-            // overflow list would cost more than the redundant walk it saves.
-            if (_sink0 == null) { _sink0 = sink; return true; }
-            if (ReferenceEquals(_sink0, sink)) return true;
-
-            if (_sink1OrRest == null) { _sink1OrRest = sink; return true; }
-            if (ReferenceEquals(_sink1OrRest, sink)) return true;
-
-            if (_sink1OrRest is List<IDeadEntrySink> list) list.Add(sink);
-            else _sink1OrRest = new List<IDeadEntrySink> { (IDeadEntrySink)_sink1OrRest, sink };
-
-            return true;
-        }
-    }
 
     /// <summary>
     /// Atomic W -&gt; C -&gt; S for events that commit on their own initiative rather
@@ -203,16 +147,9 @@ public class SyncState
         Volatile.Write(ref _value, S);
 
         NackNode? toFireHead = null;
-        IDeadEntrySink? sink0;
-        object? sink1OrRest;
 
         lock (this)
         {
-            sink0 = _sink0;
-            _sink0 = null;
-            sink1OrRest = _sink1OrRest;
-            _sink1OrRest = null;
-
             var curr = _nacks;
             _nacks = null;
             while (curr != null)
@@ -226,16 +163,6 @@ public class SyncState
                 curr = next;
             }
         }
-
-        // Outside the lock, and this is load-bearing. Cleanup takes the channel's lock,
-        // while the parking path takes the channel lock and then THIS lock (via
-        // TryRegisterSink). Holding this lock while reaching for a channel lock would
-        // invert that order and deadlock. Releasing first means the only nesting in the
-        // system stays channel -> state, with no cycle.
-        sink0?.NoteDeadEntry();
-        if (sink1OrRest is IDeadEntrySink one) one.NoteDeadEntry();
-        else if (sink1OrRest is List<IDeadEntrySink> many)
-            foreach (var s in many) s.NoteDeadEntry();
 
         while (toFireHead != null)
         {
