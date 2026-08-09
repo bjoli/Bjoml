@@ -9,6 +9,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"runtime"
 	"sync"
@@ -16,15 +17,30 @@ import (
 	"time"
 )
 
-func main() {
-	fmt.Printf("Go %s, GOMAXPROCS=%d\n\n", runtime.Version(), runtime.GOMAXPROCS(0))
+// repeat runs a benchmark back-to-back, mirroring --reps in ../Bench and ../hopac.
+//
+// Go has no tiered JIT, so it does not need the warm-up the .NET suites do — it is
+// at full speed on the first iteration. The flag exists so all three suites are
+// driven identically and the comparison stays like-for-like; for Go the extra reps
+// simply measure run-to-run variance, which is itself worth seeing.
+func repeat(reps int, body func()) {
+	for i := 0; i < reps; i++ {
+		body()
+	}
+}
 
-	spawnStorm()
-	spawnAndSend()
-	pingPong()
-	ring()
-	selectChoose()
-	fanOut()
+func main() {
+	reps := flag.Int("reps", 1, "repetitions per benchmark")
+	flag.Parse()
+
+	fmt.Printf("Go %s, GOMAXPROCS=%d, reps=%d\n\n", runtime.Version(), runtime.GOMAXPROCS(0), *reps)
+
+	repeat(*reps, spawnStorm)
+	repeat(*reps, spawnAndSend)
+	repeat(*reps, pingPong)
+	repeat(*reps, ring)
+	repeat(*reps, selectChoose)
+	repeat(*reps, fanOut)
 }
 
 // 1. Spawn storm: N goroutines that do nothing but bump a counter and exit.

@@ -15,24 +15,44 @@ namespace Bjoml.Bench;
 
 public static class Program
 {
-    public static async Task Main()
+    /// <summary>
+    /// Run <paramref name="body"/> back-to-back so the reader can see the warm-up curve.
+    ///
+    /// Repetitions are CONSECUTIVE per benchmark rather than looping the whole suite,
+    /// because what needs to reach steady state is this benchmark's own code path: its
+    /// generic instantiations, its async state machines, and the tier-1 recompilation
+    /// with PGO that only happens after enough invocations. Interleaving other
+    /// benchmarks between reps would let those decay.
+    /// </summary>
+    static async Task Repeat(int reps, Func<Task> body)
+    {
+        for (int i = 0; i < reps; i++) await body();
+    }
+
+    public static async Task Main(string[] args)
     {
         Scheduler.Start();
 
+        // --reps N. Default 1 keeps the historical single-shot behaviour, which every
+        // number in BENCHMARKS.md was produced with.
+        int reps = 1;
+        for (int i = 0; i < args.Length - 1; i++)
+            if (args[i] == "--reps") reps = int.Parse(args[i + 1]);
+
         Console.WriteLine($".NET {Environment.Version}, ProcessorCount={Environment.ProcessorCount}, " +
-                          $"ServerGC={System.Runtime.GCSettings.IsServerGC}");
+                          $"ServerGC={System.Runtime.GCSettings.IsServerGC}, reps={reps}");
         Console.WriteLine();
 
         // Warm up the JIT so the first benchmark is not paying for everything.
         await Warmup();
 
-        await SpawnStorm();
-        await SpawnStormInside();
-        await SpawnAndSend();
-        await PingPong();
-        await Ring();
-        await SelectChoose();
-        await FanOut();
+        await Repeat(reps, SpawnStorm);
+        await Repeat(reps, SpawnStormInside);
+        await Repeat(reps, SpawnAndSend);
+        await Repeat(reps, PingPong);
+        await Repeat(reps, Ring);
+        await Repeat(reps, SelectChoose);
+        await Repeat(reps, FanOut);
 
         // SimpleChannel is the like-for-like comparison against a Go `chan`: both
         // are plain unbuffered point-to-point rendezvous with no composition. The
@@ -44,9 +64,9 @@ public static class Program
         // capability the CML channel is charging for.
         Console.WriteLine();
         Console.WriteLine("--- SimpleChannel (non-composable, like a Go chan) ---");
-        await SpawnAndSendSimple();
-        await PingPongSimple();
-        await RingSimple();
+        await Repeat(reps, SpawnAndSendSimple);
+        await Repeat(reps, PingPongSimple);
+        await Repeat(reps, RingSimple);
     }
 
     static async Task Warmup()

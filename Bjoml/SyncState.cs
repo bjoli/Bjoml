@@ -86,14 +86,22 @@ public class SyncState
     // handed to somebody else by the time we look at it. A redundant clean costs one
     // short list walk; a missed one leaks forever.
     //
-    // ONE field, holding either a single IDeadEntrySink or a List of them.
+    // Two inline slots, the second doubling as the overflow list for three or more.
     //
     // SyncState is allocated once per Cml.Sync, so every reference field added here
-    // lands directly in the per-op allocation figure: measured on Select/Choose, two
-    // fields cost +16 B/op and three cost +24, while the overflow List itself never
-    // showed up at all. Packing into one field is therefore worth the type test —
-    // it is the field count that is expensive, not the rare list.
-    private object? _sinks;
+    // lands in the per-op allocation figure at 8 B/op each. That argues for packing
+    // into as few fields as possible — but a single field forces a List as soon as a
+    // block parks in TWO channels, which is exactly what an ordinary two-way choose
+    // does. Warm, that List fires on most commits and costs 88 B/op and ~80 ns:
+    //
+    //   Select/Choose, median of 9 reps, steady state
+    //     baseline, no cleanup tracking     130 ns/op    40 B/op
+    //     one packed field (List fires)     213 ns/op   136 B/op
+    //
+    // So two slots. A two-way choose is the common shape and must not allocate; three
+    // or more is rare enough to pay for a List.
+    private IDeadEntrySink? _sink0;
+    private object? _sink1OrRest;   // IDeadEntrySink, or List<IDeadEntrySink> for 3+
 
     /// <summary>The next event index to be minted.</summary>
     public int CurrentEventId => Volatile.Read(ref _eventIdCounter);
@@ -137,22 +145,17 @@ public class SyncState
         {
             if (Volatile.Read(ref _value) == S) return false;
 
-            if (_sinks == null)
-            {
-                _sinks = sink;
-            }
-            else if (_sinks is List<IDeadEntrySink> list)
-            {
-                // No dedupe scan here: a redundant clean is a short walk, and paying an
-                // O(n) scan on every park to avoid it would be the worse trade.
-                list.Add(sink);
-            }
-            else if (!ReferenceEquals(_sinks, sink))
-            {
-                // Second distinct channel; promote to a list. Dedupes the very common
-                // `choose [recv ch; send ch]` shape for free via the reference check.
-                _sinks = new List<IDeadEntrySink> { (IDeadEntrySink)_sinks, sink };
-            }
+            // The reference checks also dedupe the common `choose [recv ch; send ch]`
+            // shape for free. Only the two inline slots are checked; scanning the
+            // overflow list would cost more than the redundant walk it saves.
+            if (_sink0 == null) { _sink0 = sink; return true; }
+            if (ReferenceEquals(_sink0, sink)) return true;
+
+            if (_sink1OrRest == null) { _sink1OrRest = sink; return true; }
+            if (ReferenceEquals(_sink1OrRest, sink)) return true;
+
+            if (_sink1OrRest is List<IDeadEntrySink> list) list.Add(sink);
+            else _sink1OrRest = new List<IDeadEntrySink> { (IDeadEntrySink)_sink1OrRest, sink };
 
             return true;
         }
@@ -200,12 +203,15 @@ public class SyncState
         Volatile.Write(ref _value, S);
 
         NackNode? toFireHead = null;
-        object? sinks;
+        IDeadEntrySink? sink0;
+        object? sink1OrRest;
 
         lock (this)
         {
-            sinks = _sinks;
-            _sinks = null;
+            sink0 = _sink0;
+            _sink0 = null;
+            sink1OrRest = _sink1OrRest;
+            _sink1OrRest = null;
 
             var curr = _nacks;
             _nacks = null;
@@ -226,8 +232,9 @@ public class SyncState
         // TryRegisterSink). Holding this lock while reaching for a channel lock would
         // invert that order and deadlock. Releasing first means the only nesting in the
         // system stays channel -> state, with no cycle.
-        if (sinks is IDeadEntrySink one) one.NoteDeadEntry();
-        else if (sinks is List<IDeadEntrySink> many)
+        sink0?.NoteDeadEntry();
+        if (sink1OrRest is IDeadEntrySink one) one.NoteDeadEntry();
+        else if (sink1OrRest is List<IDeadEntrySink> many)
             foreach (var s in many) s.NoteDeadEntry();
 
         while (toFireHead != null)

@@ -17,6 +17,7 @@
 
 using System;
 using System.Runtime.CompilerServices;
+using System.Threading;
 
 namespace Bjoml;
 
@@ -144,6 +145,14 @@ public class Channel<T> : IEvent<T>, IDeadEntrySink
     /// </summary>
     void IDeadEntrySink.NoteDeadEntry()
     {
+        // Cleaned immediately rather than amortised behind a dead-entry threshold.
+        //
+        // Thresholding was tried and rejected. It only bounds growth at the threshold
+        // instead of driving it to zero — an abandoned channel keeps its loser forever,
+        // and 500 losing branches left 20 stranded — and it bought just 173 -> 158 ns/op
+        // on Select/Choose. That is a poor price for giving up the zero-stranded
+        // guarantee, because the remaining cost is not this walk at all: it is the extra
+        // lock TryRegisterSink takes on every park. See SyncState.
         lock (_lock)
         {
             CleanTakers();
@@ -151,8 +160,10 @@ public class Channel<T> : IEvent<T>, IDeadEntrySink
         }
     }
 
-    private void CleanTakers()
+    /// <summary>Unlink and recycle synchronized takers. Returns the surviving count.</summary>
+    private int CleanTakers()
     {
+        int live = 0;
         GetOp<T>? prev = null;
         GetOp<T>? curr = _takersHead;
         while (curr != null)
@@ -170,13 +181,17 @@ public class Channel<T> : IEvent<T>, IDeadEntrySink
             else
             {
                 prev = curr;
+                live++;
             }
             curr = next;
         }
+        return live;
     }
 
-    private void CleanGivers()
+    /// <summary>Unlink and recycle synchronized givers. Returns the surviving count.</summary>
+    private int CleanGivers()
     {
+        int live = 0;
         PutOp<T>? prev = null;
         PutOp<T>? curr = _giversHead;
         while (curr != null)
@@ -194,9 +209,11 @@ public class Channel<T> : IEvent<T>, IDeadEntrySink
             else
             {
                 prev = curr;
+                live++;
             }
             curr = next;
         }
+        return live;
     }
 
     public void PublishSend(SyncState state, int eventId, T value, Action resumePut)

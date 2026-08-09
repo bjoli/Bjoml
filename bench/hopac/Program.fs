@@ -346,23 +346,31 @@ let selectRepeated reps =
         (samples |> Array.map (sprintf "%6.0f") |> String.concat " ")
     printfn "               median : %.0f ns/op" sorted.[reps / 2]
 
-let private mainSuite () =
-    printfn ".NET %O, ProcessorCount=%d, ServerGC=%b, Hopac %s"
+/// Run a benchmark back-to-back. Consecutive per benchmark rather than looping the
+/// whole suite, so each one's own code path reaches tier-1-with-PGO before the next
+/// starts. See the BjoML side for the reasoning; both suites must repeat the same way
+/// or the comparison is not like-for-like.
+let private repeat reps (body: unit -> unit) =
+    for _ in 1 .. reps do body ()
+
+let private mainSuite reps =
+    printfn ".NET %O, ProcessorCount=%d, ServerGC=%b, Hopac %s, reps=%d"
         Environment.Version
         Environment.ProcessorCount
         System.Runtime.GCSettings.IsServerGC
         (typeof<Hopac.Job<int>>.Assembly.GetName().Version |> string)
+        reps
     printfn ""
 
     warmup ()
 
-    spawnStorm ()
-    spawnStormInside ()
-    spawnAndSend ()
-    pingPong ()
-    ring ()
-    selectChoose ()
-    fanOut ()
+    repeat reps spawnStorm
+    repeat reps spawnStormInside
+    repeat reps spawnAndSend
+    repeat reps pingPong
+    repeat reps ring
+    repeat reps selectChoose
+    repeat reps fanOut
     0
 
 [<EntryPoint>]
@@ -377,4 +385,10 @@ let main argv =
         selectRepeated reps
         0
     else
-        mainSuite ()
+        // --reps N, matching bench/Bench. Default 1 preserves the historical
+        // single-shot behaviour.
+        let reps =
+            match Array.tryFindIndex ((=) "--reps") argv with
+            | Some i when i + 1 < argv.Length -> int argv.[i + 1]
+            | _ -> 1
+        mainSuite reps
