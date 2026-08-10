@@ -229,7 +229,15 @@ public static class Scheduler
         }
     }
 
-    internal static void ReportUnhandled(Exception ex)
+    /// <summary>
+    /// Report a failure nobody is going to look at.
+    ///
+    /// Public so that a hosted language can route a detached fiber's exception
+    /// here rather than invoking <see cref="UnhandledException"/> directly —
+    /// the property has no guard, and a handler that throws while reporting a
+    /// failure would take the process down over a diagnostic.
+    /// </summary>
+    public static void ReportUnhandled(Exception ex)
     {
         try { UnhandledException(ex); }
         catch { /* a throwing handler must not take the process down */ }

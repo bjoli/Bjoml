@@ -203,8 +203,16 @@ public class Promise<T> : IEvent<Result<T>>
         }
     }
 
-    /// <summary>Pipe this promise's outcome into <paramref name="target"/> when it lands.</summary>
-    internal void Forward(Promise<T> target)
+    /// <summary>
+    /// Pipe this promise's outcome into <paramref name="target"/> when it lands.
+    ///
+    /// Public because a hosted language needs it: a child cancellation token is
+    /// a promise forwarded from its parent's, so that cancelling a scope
+    /// cancels everything under it. Safe to expose for the reason the nack rule
+    /// asks about — it runs no user code, only <c>TrySetResult</c> on the
+    /// target — so a borrowed thread stays borrowed for a pointer store.
+    /// </summary>
+    public void Forward(Promise<T> target)
     {
         if (IsCompleted)
         {
@@ -236,6 +244,30 @@ public class Promise<T> : IEvent<Result<T>>
         }
 
         public bool IsAbandoned => _target.IsCompleted;
+    }
+
+    /// <summary>
+    /// Stop listening, deliberately, and make sure a failure is still heard.
+    ///
+    /// What a hosted language's "discard this handle" means for a promise.
+    /// Dropping the reference instead would lose an exception inside it
+    /// silently: nothing else is watching, so a fiber that died would simply
+    /// never be mentioned. This registers a completion callback that routes a
+    /// failure to <see cref="Scheduler.ReportUnhandled"/> and ignores success.
+    ///
+    /// Deliberately *not* the same thing as exposing
+    /// <see cref="OnCompleted"/>. That would hand out a callback slot running
+    /// on a borrowed thread with whatever context it happened to have, which is
+    /// exactly where user code must never go. This one takes no callback, so
+    /// there is nothing to misuse.
+    /// </summary>
+    public void Detach()
+    {
+        OnCompleted(() =>
+        {
+            var r = Outcome;
+            if (r.IsError) Scheduler.ReportUnhandled(r.Error!.SourceException);
+        });
     }
 
     // ---- CML surface -------------------------------------------------------

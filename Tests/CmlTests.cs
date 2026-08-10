@@ -38,6 +38,177 @@ public static class CmlTests
         Section("Baseline combinator behaviour");
         Run("wrap maps the value", WrapMapsValue);
         Run("guard is evaluated at sync time", GuardIsDeferred);
+
+        Section("Timers");
+        Run("a timeout becomes available on its own", TimeoutFires);
+        Run("a timeout loses to something already available", TimeoutLoses);
+        Run("a timeout is relative to each sync, not to when it was built", TimeoutIsRebuiltPerSync);
+        Run("an absolute deadline does not restart on the next sync", AtIsAbsolute);
+        Run("a timeout that already passed is available at once", AtInThePastFiresNow);
+
+        Section("Detaching and linking a promise");
+        Run("detach routes a failure to the scheduler", DetachReportsFailure);
+        Run("detach stays quiet on success", DetachIsQuietOnSuccess);
+        Run("forward pipes an outcome into another promise", ForwardPipesOutcome);
+    }
+
+    // -----------------------------------------------------------------------
+    // Timers
+    // -----------------------------------------------------------------------
+
+    private static void TimeoutFires()
+    {
+        var done = new ManualResetEventSlim(false);
+        Cml.Sync(Cml.Timeout(50), _ => done.Set());
+        Await(done, "a 50 ms timeout");
+    }
+
+    /// <summary>
+    /// The point of a timeout is to lose most of the time. It goes second
+    /// because `choose` stops publishing at the first available branch, and a
+    /// branch that is never published cannot be the one under test.
+    /// </summary>
+    private static void TimeoutLoses()
+    {
+        var result = new ManualResetEventSlim(false);
+        string? got = null;
+
+        Cml.Sync(
+            Cml.Choose(
+                Cml.Wrap(Cml.Timeout(5000), _ => "timeout"),
+                Cml.Wrap(Cml.Always(1), _ => "value")),
+            v => { got = v; result.Set(); });
+
+        Await(result, "the choose to commit");
+        AssertEqual("value", got, "the wrong branch won");
+    }
+
+    /// <summary>
+    /// Built once and synced twice, a relative timeout must wait the full
+    /// interval BOTH times. Without the guard the deadline would be in the past
+    /// by the second sync — which inside a `choose` loop means the timeout
+    /// branch wins every iteration after the first, silently.
+    /// </summary>
+    private static void TimeoutIsRebuiltPerSync()
+    {
+        var ev = Cml.Timeout(120);
+
+        var first = new ManualResetEventSlim(false);
+        Cml.Sync(ev, _ => first.Set());
+        Await(first, "the first sync");
+
+        var start = DateTime.UtcNow;
+        var second = new ManualResetEventSlim(false);
+        Cml.Sync(ev, _ => second.Set());
+        Await(second, "the second sync");
+
+        var waited = (DateTime.UtcNow - start).TotalMilliseconds;
+        Assert(waited > 60, $"the second sync returned after {waited:F0} ms, so the deadline was not rebuilt");
+    }
+
+    /// <summary>
+    /// The other half of the same distinction. An absolute deadline is fixed
+    /// when it is built, so a second sync after it has passed is available at
+    /// once — which is what makes it usable as a budget for a whole loop.
+    /// </summary>
+    private static void AtIsAbsolute()
+    {
+        var ev = Cml.At(DateTime.UtcNow.AddMilliseconds(120));
+
+        var first = new ManualResetEventSlim(false);
+        Cml.Sync(ev, _ => first.Set());
+        Await(first, "the deadline");
+
+        var start = DateTime.UtcNow;
+        var second = new ManualResetEventSlim(false);
+        Cml.Sync(ev, _ => second.Set());
+        Await(second, "the second sync");
+
+        var waited = (DateTime.UtcNow - start).TotalMilliseconds;
+        Assert(waited < 60, $"the second sync waited {waited:F0} ms, so the deadline restarted");
+    }
+
+    private static void AtInThePastFiresNow()
+    {
+        var done = new ManualResetEventSlim(false);
+        Cml.Sync(Cml.At(DateTime.UtcNow.AddSeconds(-10)), _ => done.Set());
+        Await(done, "a deadline that has already passed", 1000);
+    }
+
+    // -----------------------------------------------------------------------
+    // Detach / Forward
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// Detaching is what "throw away this handle" has to mean for a promise.
+    /// Dropping the reference would lose the exception inside it silently,
+    /// because nothing else is watching.
+    /// </summary>
+    private static void DetachReportsFailure()
+    {
+        var reported = new ManualResetEventSlim(false);
+        Exception? seen = null;
+
+        var previous = Scheduler.UnhandledException;
+        Scheduler.UnhandledException = ex => { seen = ex; reported.Set(); };
+
+        try
+        {
+            var p = new Promise<int>();
+            p.Detach();
+            p.TrySetException(new InvalidOperationException("boom"));
+
+            Await(reported, "the detached failure to be reported");
+            Assert(seen is InvalidOperationException, $"reported the wrong exception: {seen}");
+            AssertEqual("boom", seen!.Message, "the exception lost its message");
+        }
+        finally
+        {
+            Scheduler.UnhandledException = previous;
+        }
+    }
+
+    private static void DetachIsQuietOnSuccess()
+    {
+        var reported = new ManualResetEventSlim(false);
+
+        var previous = Scheduler.UnhandledException;
+        Scheduler.UnhandledException = _ => reported.Set();
+
+        try
+        {
+            var p = new Promise<int>();
+            p.Detach();
+            p.TrySetResult(7);
+
+            AssertNoSignal(reported, "a successful detached promise reporting a failure");
+        }
+        finally
+        {
+            Scheduler.UnhandledException = previous;
+        }
+    }
+
+    /// <summary>
+    /// What a child cancellation token is built out of: cancelling a parent
+    /// scope has to cancel everything under it.
+    /// </summary>
+    private static void ForwardPipesOutcome()
+    {
+        var parent = new Promise<int>();
+        var child = new Promise<int>();
+        parent.Forward(child);
+
+        Assert(!child.IsCompleted, "the child landed before the parent");
+
+        parent.TrySetResult(42);
+
+        var done = new ManualResetEventSlim(false);
+        int got = 0;
+        Cml.Sync(child.Join(), r => { got = r.Value; done.Set(); });
+
+        Await(done, "the forwarded outcome");
+        AssertEqual(42, got, "the child got the wrong value");
     }
 
     // -----------------------------------------------------------------------

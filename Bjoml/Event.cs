@@ -69,6 +69,74 @@ public static class Cml
     public static IEvent<T> Always<T>(T value) => new AlwaysEvent<T>(value);
     
     public static IEvent<T> Never<T>() => new NeverEvent<T>();
+
+    // ---- timers ------------------------------------------------------------
+
+    /// <summary>
+    /// The event that becomes available <paramref name="ms"/> milliseconds
+    /// after it is SYNCED — not after it is built.
+    ///
+    /// The <see cref="Guard{T}"/> is the whole reason this is not just a
+    /// promise and a timer. Built once and reused, a relative deadline is in
+    /// the past after the first iteration, so its branch would win every time
+    /// round a <c>choose</c> loop thereafter. Rebuilding at each sync is what
+    /// "five seconds from now" has to mean inside a loop.
+    ///
+    /// The <see cref="WithNack{T}"/> is the other half. A losing branch has to
+    /// dispose its timer, or every iteration of a select over a timeout leaks a
+    /// live one until it fires.
+    /// </summary>
+    public static IEvent<Unit> Timeout(int ms) => Guard(() => TimerEvent(ms));
+
+    /// <summary>
+    /// The event that becomes available at a fixed instant.
+    ///
+    /// Absolute, and therefore NOT the same thing as <see cref="Timeout"/>: the
+    /// deadline is decided when this is built, and only the remaining interval
+    /// is recomputed at each sync. That is what makes it usable as an overall
+    /// budget for a loop, where a relative timeout would restart on every
+    /// iteration and never expire.
+    /// </summary>
+    public static IEvent<Unit> At(DateTime utcDeadline) =>
+        Guard(() =>
+        {
+            var remaining = (utcDeadline - DateTime.UtcNow).TotalMilliseconds;
+            var ms = remaining <= 0 ? 0 : (remaining > int.MaxValue ? int.MaxValue : (int)remaining);
+            return TimerEvent(ms);
+        });
+
+    /// <summary>
+    /// One armed timer, disposed exactly once by whichever of the two paths
+    /// gets there first: the branch lost, or the timer fired.
+    ///
+    /// The same shape as <c>TaskInterop.Cancellable</c>, for the same reason.
+    /// </summary>
+    private static IEvent<Unit> TimerEvent(int ms) =>
+        WithNack<Unit>(nack =>
+        {
+            var p = new Promise<Unit>();
+
+            var timer = new System.Threading.Timer(
+                static s => ((Promise<Unit>)s!).TrySetResult(default),
+                p,
+                ms,
+                System.Threading.Timeout.Infinite);
+
+            int disposed = 0;
+
+            void DisposeOnce()
+            {
+                if (System.Threading.Interlocked.Exchange(ref disposed, 1) == 0) timer.Dispose();
+            }
+
+            // Neither of these runs user code, which is the rule for anything
+            // reachable from a nack: they run on a borrowed thread with
+            // whatever context it happened to have.
+            Sync(nack, _ => DisposeOnce());
+            p.OnCompleted(DisposeOnce);
+
+            return Wrap(p.Join(), static r => r.Value);
+        });
 }
 
 // ---------------- Implementation of Combinators ----------------
