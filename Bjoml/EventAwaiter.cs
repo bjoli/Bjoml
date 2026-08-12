@@ -29,29 +29,70 @@ namespace Bjoml;
 /// </summary>
 public static class EventAwaitExtensions
 {
-    public static EventAwaiter<T> GetAwaiter<T>(this IEvent<T> ev) => new EventAwaiter<T>(ev);
+    public static EventAwaiter<T> GetAwaiter<T>(this IEvent<T> ev) => EventAwaiter<T>.Rent(ev);
 }
 
 /// <summary>
-/// The synchronisation is STARTED in the constructor, i.e. when <c>await</c>
-/// evaluates its operand.
+/// The synchronisation is STARTED in <see cref="Rent"/> (or the constructor), i.e.
+/// when <c>await</c> evaluates its operand.
 ///
 /// If the rendezvous matches inline — the common case, because
 /// <see cref="Scheduler.Dispatch"/> runs continuations on the matching thread —
 /// <see cref="IsCompleted"/> is already true and the compiler never asks for a
 /// continuation, so no resume delegate is created and the fiber never suspends.
+///
+/// POOLED, like <see cref="GetOp{T}"/>/<see cref="PutOp{T}"/>, and for the same
+/// reason: one of these per await was 2 of the 3 allocations on the fiber choose
+/// path (the object, plus the method-group conversion of <c>OnSync</c> minting a
+/// fresh <c>Action&lt;T&gt;</c> per sync — a pooled instance carries its delegate
+/// for life). The third, <see cref="SyncState"/>, must NOT be pooled: losing
+/// choose branches linger in channels and are reclaimed lazily (see the B7 notes
+/// in <c>Channel.cs</c>), so a recycled state back in W would make a stale parked
+/// op look live again.
+///
+/// The recycle point is <see cref="GetResult"/>, which the await contract calls
+/// exactly once, after completion. Losing branches keep dead references to the
+/// <c>OnSync</c> delegate in parked ops, but never invoke it — every channel path
+/// checks <c>TrySync</c>/<c>IsSynchronized</c> before resuming — so they only pin
+/// the pooled object, which is exactly what a pool wants pinned.
+///
+/// Field resets happen at recycle time, NOT at rent: they must be complete before
+/// <see cref="Cml.Sync"/> publishes, because the instant an op is parked, a thread
+/// on the other side of the channel can call <see cref="OnSync"/> concurrently.
 /// </summary>
 public sealed class EventAwaiter<T> : ICriticalNotifyCompletion
 {
     /// <summary>Marks "already completed" so a late continuation runs immediately.</summary>
     private static readonly Action Sentinel = () => { };
 
+    private const int MaxCached = 64;
+    [ThreadStatic] private static EventAwaiter<T>? _free;
+    [ThreadStatic] private static int _freeCount;
+
+    private EventAwaiter<T>? _next;
+    private readonly Action<T> _onSync;
     private T _result = default!;
     private Action? _continuation;
 
-    public EventAwaiter(IEvent<T> ev)
+    private EventAwaiter() => _onSync = OnSync;
+
+    public EventAwaiter(IEvent<T> ev) : this()
     {
-        Cml.Sync(ev, OnSync);
+        Cml.Sync(ev, _onSync);
+    }
+
+    public static EventAwaiter<T> Rent(IEvent<T> ev)
+    {
+        var aw = _free;
+        if (aw is null) return new EventAwaiter<T>(ev);
+
+        _free = aw._next;
+        _freeCount--;
+        aw._next = null;
+
+        // _result/_continuation were cleared when this instance was recycled.
+        Cml.Sync(ev, aw._onSync);
+        return aw;
     }
 
     private void OnSync(T value)
@@ -70,7 +111,31 @@ public sealed class EventAwaiter<T> : ICriticalNotifyCompletion
 
     public bool IsCompleted => ReferenceEquals(Volatile.Read(ref _continuation), Sentinel);
 
-    public T GetResult() => _result;
+    /// <summary>
+    /// Return the result and recycle this awaiter.
+    ///
+    /// Safe because everything <see cref="OnSync"/> does to this object
+    /// happens-before the continuation runs (the Exchange is a full fence, and the
+    /// inline-completion path finishes OnSync before IsCompleted can observe the
+    /// Sentinel), and the await contract calls GetResult exactly once, afterwards.
+    /// Clearing <c>_result</c> here rather than at rent keeps a pooled awaiter from
+    /// pinning a stale T, mirroring <see cref="GetOp{T}.Recycle"/>.
+    /// </summary>
+    public T GetResult()
+    {
+        var r = _result;
+        _result = default!;
+        _continuation = null;
+
+        if (_freeCount < MaxCached)
+        {
+            _next = _free;
+            _free = this;
+            _freeCount++;
+        }
+
+        return r;
+    }
 
     public void OnCompleted(Action continuation) => UnsafeOnCompleted(continuation);
 

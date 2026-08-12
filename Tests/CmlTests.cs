@@ -45,6 +45,13 @@ public static class CmlTests
         Run("a timeout is relative to each sync, not to when it was built", TimeoutIsRebuiltPerSync);
         Run("an absolute deadline does not restart on the next sync", AtIsAbsolute);
         Run("a timeout that already passed is available at once", AtInThePastFiresNow);
+        Run("a cancelled timeout never fires into a later sync", CancelledTimeoutStaysQuiet);
+        Run("combinator spec: a timeout becomes available on its own", SpecTimeoutFires);
+        Run("combinator spec: a timeout loses to something already available", SpecTimeoutLoses);
+
+        Section("Choice order");
+        Run("choose is deterministic left-to-right by default", ChooseIsDeterministicByDefault);
+        Run("randomized choose lets every branch win", RandomizedChooseIsFair);
 
         Section("Detaching and linking a promise");
         Run("detach routes a failure to the scheduler", DetachReportsFailure);
@@ -133,6 +140,111 @@ public static class CmlTests
         var done = new ManualResetEventSlim(false);
         Cml.Sync(Cml.At(DateTime.UtcNow.AddSeconds(-10)), _ => done.Set());
         Await(done, "a deadline that has already passed", 1000);
+    }
+
+    /// <summary>
+    /// 500 sync blocks in which a 1 ms timeout is armed and races a promise
+    /// completed from another thread. The deadline and the loss race constantly,
+    /// so both orders of Fire vs Cancel are exercised. Each block must commit
+    /// exactly once, and no late timer callback may leak into a later block —
+    /// the fresh-TimeoutNode-per-arm design is what makes the latter impossible
+    /// (a pooled node's cancel delegate could be fired by a PREVIOUS sync's nack,
+    /// which has no CAS gate); this is the regression test for that choice.
+    /// </summary>
+    private static void CancelledTimeoutStaysQuiet()
+    {
+        int count = 0;
+        for (int i = 0; i < 500; i++)
+        {
+            var done = new ManualResetEventSlim(false);
+            var p = new Promise<int>();
+            ThreadPool.UnsafeQueueUserWorkItem(_ => p.TrySetResult(1), null);
+
+            Cml.Sync(
+                Cml.Choose(
+                    Cml.Wrap(p.Join(), static _ => 1),
+                    Cml.Wrap(Cml.Timeout(1), static _ => 2)),
+                _ => { Interlocked.Increment(ref count); done.Set(); });
+
+            Await(done, $"sync {i}");
+        }
+
+        Thread.Sleep(100);   // let any stray timer callbacks run
+        AssertEqual(500, count, "each sync must commit exactly once");
+    }
+
+    private static void SpecTimeoutFires()
+    {
+        var done = new ManualResetEventSlim(false);
+        Cml.Sync(Cml.TimeoutViaCombinators(50), _ => done.Set());
+        Await(done, "a 50 ms combinator timeout");
+    }
+
+    private static void SpecTimeoutLoses()
+    {
+        var result = new ManualResetEventSlim(false);
+        string? got = null;
+
+        Cml.Sync(
+            Cml.Choose(
+                Cml.Wrap(Cml.TimeoutViaCombinators(5000), static _ => "timeout"),
+                Cml.Wrap(Cml.Always(1), static _ => "value")),
+            v => { got = v; result.Set(); });
+
+        Await(result, "the choose to commit");
+        AssertEqual("value", got, "the wrong branch won");
+    }
+
+    // -----------------------------------------------------------------------
+    // Choice order
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// Publish order is priority: with randomization off, the first ready
+    /// branch wins every time. This is a documented semantic, not an accident —
+    /// pin it so a change to the publish loop cannot silently alter it.
+    /// </summary>
+    private static void ChooseIsDeterministicByDefault()
+    {
+        for (int i = 0; i < 100; i++)
+        {
+            string? got = null;
+            var done = new ManualResetEventSlim(false);
+            Cml.Sync(
+                Cml.Choose(Cml.Always("first"), Cml.Always("second")),
+                v => { got = v; done.Set(); });
+            Await(done, "the choose");
+            AssertEqual("first", got, "publish order is priority; the first ready branch must win");
+        }
+    }
+
+    /// <summary>
+    /// With randomization on, every always-ready branch must eventually win.
+    /// Four branches over up to 400 syncs: the chance of missing one by luck is
+    /// (3/4)^400 per branch, i.e. zero for test purposes.
+    /// </summary>
+    private static void RandomizedChooseIsFair()
+    {
+        Cml.RandomizeChoice = true;
+        try
+        {
+            var seen = new System.Collections.Generic.HashSet<string>();
+            for (int i = 0; i < 400 && seen.Count < 4; i++)
+            {
+                string? got = null;
+                var done = new ManualResetEventSlim(false);
+                Cml.Sync(
+                    Cml.Choose(Cml.Always("a"), Cml.Always("b"), Cml.Always("c"), Cml.Always("d")),
+                    v => { got = v; done.Set(); });
+                Await(done, "the choose");
+                seen.Add(got!);
+            }
+            AssertEqual(4, seen.Count, "with randomization every always-ready branch must eventually win");
+        }
+        finally
+        {
+            Cml.RandomizeChoice = false;
+        }
     }
 
     // -----------------------------------------------------------------------

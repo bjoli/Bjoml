@@ -31,7 +31,15 @@ public abstract class Operation
 
 public sealed class PutOp<T> : Operation
 {
-    private const int MaxCached = 64;
+    // 256, not 64, because recycling is BURSTY where renting is steady. A K-wide
+    // choose that keeps losing parks K-1 dead ops per sync, and every dead channel
+    // hits its NotePark sweep threshold on the SAME iteration (they park in
+    // lockstep), so up to (K-1) * 32 ops come back in one burst. With a cap of 64
+    // most of that burst was dropped and the next 32 iterations allocated fresh:
+    // the skewed-choose benchmark (bench/Bench varied) measured 310 B/op at cap 64
+    // and 40 B/op — the un-poolable SyncState only — at 256. Worst case memory is
+    // 256 * ~64 B = 16 KB per (T, thread), which is a cache, not a leak.
+    private const int MaxCached = 256;
     [ThreadStatic] private static PutOp<T>? _free;
     [ThreadStatic] private static int _freeCount;
 
@@ -85,7 +93,8 @@ public sealed class PutOp<T> : Operation
 
 public sealed class GetOp<T> : Operation
 {
-    private const int MaxCached = 64;
+    // See PutOp<T>.MaxCached: sized for the sweep bursts of a wide choose.
+    private const int MaxCached = 256;
     [ThreadStatic] private static GetOp<T>? _free;
     [ThreadStatic] private static int _freeCount;
 

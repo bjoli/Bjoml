@@ -15,6 +15,9 @@
       <!-- The regression tests need to observe parked operations to get a reliable
            "this fiber has suspended" signal. -->
       <InternalsVisibleTo Include="Tests" />
+      <!-- The diagnostic harness benchmarks the direct TimeoutEvent against the
+           retained combinator specification (Cml.TimeoutViaCombinators). -->
+      <InternalsVisibleTo Include="Diag" />
     </ItemGroup>
 
 </Project>
