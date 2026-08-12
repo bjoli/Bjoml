@@ -26,6 +26,20 @@ namespace Bjoml;
 // ---------------------------------------------------------------------------
 
 /// <summary>
+/// Marker for "this work item's <c>Execute</c> is equivalent to invoking its
+/// resume <c>Action</c>". Implemented ONLY by <see cref="FiberStateMachineBox{T}"/>.
+///
+/// <c>Promise.Complete</c> uses it to wake a parked fiber by enqueuing the box
+/// itself instead of routing the fiber's resume delegate through a pooled
+/// <c>ActionWorkItem</c>. The marker is what makes the target-sniff sound: a
+/// delegate can wrap ANY method of an object that happens to implement
+/// <see cref="IThreadPoolWorkItem"/>, and enqueuing such an object would run the
+/// wrong code. Only mark a type with this if invoking <c>Execute</c> and
+/// invoking the only <c>Action</c> the type ever hands out are the same thing.
+/// </summary>
+internal interface IFiberResume : IThreadPoolWorkItem { }
+
+/// <summary>
 /// Heap home for a fiber's state machine, allocated once at the first suspension
 /// (the same trick the BCL's <c>AsyncTaskMethodBuilder</c> uses).
 ///
@@ -36,7 +50,7 @@ namespace Bjoml;
 /// It implements <see cref="IThreadPoolWorkItem"/> directly, so resuming a fiber
 /// from the scheduler costs no wrapper allocation at all.
 /// </summary>
-internal sealed class FiberStateMachineBox<TStateMachine> : IThreadPoolWorkItem
+internal sealed class FiberStateMachineBox<TStateMachine> : IFiberResume
     where TStateMachine : IAsyncStateMachine
 {
     public TStateMachine StateMachine = default!;

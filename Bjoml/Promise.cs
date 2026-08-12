@@ -150,21 +150,16 @@ public class Promise<T> : IEvent<Result<T>>
 
         if (oldWaiters != null)
         {
-            // The waiter itself is the work item; see PromiseWaiter. No delegate,
-            // no ActionWorkItem, no allocation on the wake path.
-            if (oldWaiters is PromiseWaiter single)
-            {
-                if (!single.IsAbandoned) Scheduler.Enqueue(single);
-            }
-            else if (oldWaiters is List<PromiseWaiter> list)
+            if (oldWaiters is List<object> list)
             {
                 lock (list)
                 {
-                    foreach (var w in list)
-                    {
-                        if (!w.IsAbandoned) Scheduler.Enqueue(w);
-                    }
+                    foreach (var w in list) Wake(w);
                 }
+            }
+            else
+            {
+                Wake(oldWaiters);
             }
         }
 
@@ -173,7 +168,52 @@ public class Promise<T> : IEvent<Result<T>>
 
     // ---- waiter registration ----------------------------------------------
 
-    internal void Register(PromiseWaiter waiter)
+    /// <summary>
+    /// Wake one registered waiter after completion.
+    ///
+    /// A waiter is either a <see cref="PromiseWaiter"/> — enqueued directly, it is
+    /// its own work item — or a bare <see cref="Action"/> stored unwrapped by
+    /// <see cref="OnCompleted"/>. For a bare action there is one more save: a
+    /// parked FIBER's resume delegate targets its state-machine box, which is
+    /// itself a work item whose <c>Execute</c> is equivalent to invoking the
+    /// delegate (that equivalence is what <see cref="IFiberResume"/> asserts; do
+    /// not widen the test to <see cref="IThreadPoolWorkItem"/>, which any object
+    /// could implement with unrelated semantics). So the common case — a fiber
+    /// blocked on a promise — wakes with zero allocation end to end.
+    /// </summary>
+    private static void Wake(object waiter)
+    {
+        if (waiter is PromiseWaiter pw)
+        {
+            if (!pw.IsAbandoned) Scheduler.Enqueue(pw);
+        }
+        else
+        {
+            var a = (Action)waiter;
+            if (a.Target is IFiberResume box) Scheduler.Enqueue(box);
+            else Scheduler.Enqueue(a);
+        }
+    }
+
+    /// <summary>Run a waiter inline; the already-completed registration path.</summary>
+    private static void SignalInline(object waiter)
+    {
+        if (waiter is PromiseWaiter pw)
+        {
+            if (!pw.IsAbandoned) pw.Signal();
+        }
+        else
+        {
+            ((Action)waiter)();
+        }
+    }
+
+    internal void Register(PromiseWaiter waiter) => RegisterAny(waiter);
+
+    /// <summary>Run <paramref name="k"/> now if already complete, else on completion.</summary>
+    internal void OnCompleted(Action k) => RegisterAny(k);
+
+    private void RegisterAny(object waiter)
     {
         SpinWait spin = default;
         while (true)
@@ -181,7 +221,7 @@ public class Promise<T> : IEvent<Result<T>>
             var current = Volatile.Read(ref _waiters);
             if (ReferenceEquals(current, s_completedSentinel))
             {
-                if (!waiter.IsAbandoned) waiter.Signal();
+                SignalInline(waiter);
                 return;
             }
 
@@ -190,46 +230,33 @@ public class Promise<T> : IEvent<Result<T>>
                 if (Interlocked.CompareExchange(ref _waiters, waiter, null) == null)
                     return;
             }
-            else if (current is PromiseWaiter single)
-            {
-                var list = new List<PromiseWaiter>(4) { single, waiter };
-                if (Interlocked.CompareExchange(ref _waiters, list, single) == single)
-                    return;
-            }
-            else if (current is List<PromiseWaiter> list)
+            else if (current is List<object> list)
             {
                 lock (list)
                 {
                     if (ReferenceEquals(Volatile.Read(ref _waiters), s_completedSentinel))
                     {
-                        if (!waiter.IsAbandoned) waiter.Signal();
+                        SignalInline(waiter);
                         return;
                     }
 
                     if (list.Count >= 8)
-                        list.RemoveAll(static w => w.IsAbandoned);
+                        list.RemoveAll(static w => w is PromiseWaiter pw && pw.IsAbandoned);
 
                     list.Add(waiter);
                     return;
                 }
             }
+            else
+            {
+                // A single waiter (bare Action or PromiseWaiter); grow to a list.
+                var grown = new List<object>(4) { current, waiter };
+                if (Interlocked.CompareExchange(ref _waiters, grown, current) == current)
+                    return;
+            }
 
             spin.SpinOnce();
         }
-    }
-
-    /// <summary>Run <paramref name="k"/> now if already complete, else on completion.</summary>
-    internal void OnCompleted(Action k) => Register(new ActionWaiter(k));
-
-    private sealed class ActionWaiter : PromiseWaiter
-    {
-        private readonly Action _k;
-        public ActionWaiter(Action k) => _k = k;
-        public override void Signal() => _k();
-
-        // A fiber awaiting a promise directly is never abandoned; it has nothing
-        // else it could be doing.
-        public override bool IsAbandoned => false;
     }
 
     internal Result<T> Outcome

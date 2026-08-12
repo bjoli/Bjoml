@@ -30,33 +30,56 @@ public static class PromiseHarness
         Console.WriteLine($"reps={reps}   (complete -> wake, per op)");
         Console.WriteLine();
 
-        Once(100_000, out _);              // warm up
+        // Two continuation shapes:
+        //  - a bare closure Action, what OnCompleted/ToTask-style callers pass;
+        //  - an Action whose Target is an IFiberResume, the exact shape of a
+        //    parked fiber's resume delegate (the state-machine box), which the
+        //    Wake fast path can enqueue directly with no wrapper at all.
+        Measure("bare action ", reps, new Action(BareTarget.Poke));
+        Measure("fiber-shaped", reps, new Action(s_boxLike.Poke));
+    }
+
+    static void Measure(string name, int reps, Action k)
+    {
+        Once(k, 100_000, out _);           // warm up
 
         var samples = new double[reps];
         double alloc = 0;
-        for (int r = 0; r < reps; r++) samples[r] = Once(1_000_000, out alloc);
+        for (int r = 0; r < reps; r++) samples[r] = Once(k, 1_000_000, out alloc);
 
         var sorted = (double[])samples.Clone();
         Array.Sort(sorted);
 
-        Console.WriteLine($"Promise wake   per rep: {string.Join(" ", Array.ConvertAll(samples, s => $"{s,6:F0}"))}");
-        Console.WriteLine($"               median : {sorted[reps / 2]:F0} ns/op   ({alloc:F0} B/op)");
+        Console.WriteLine($"Promise wake ({name}) per rep: {string.Join(" ", Array.ConvertAll(samples, s => $"{s,6:F0}"))}");
+        Console.WriteLine($"                             median : {sorted[reps / 2]:F0} ns/op   ({alloc:F0} B/op)");
     }
 
     static int s_remaining;
     static readonly ManualResetEventSlim s_done = new(false);
 
-    static double Once(int rounds, out double bytesPerOp)
+    static void Step()
+    {
+        if (Interlocked.Decrement(ref s_remaining) == 0) s_done.Set();
+    }
+
+    static class BareTarget
+    {
+        public static void Poke() => Step();
+    }
+
+    /// <summary>Mimics FiberStateMachineBox: Execute ≡ invoking its action.</summary>
+    sealed class BoxLike : IFiberResume
+    {
+        public void Poke() => Step();
+        public void Execute() => Step();
+    }
+
+    static readonly BoxLike s_boxLike = new();
+
+    static double Once(Action k, int rounds, out double bytesPerOp)
     {
         s_remaining = rounds;
         s_done.Reset();
-
-        // One continuation delegate for the whole run, so the harness itself
-        // allocates nothing per op.
-        Action k = static () =>
-        {
-            if (Interlocked.Decrement(ref s_remaining) == 0) s_done.Set();
-        };
 
         long before = GC.GetTotalAllocatedBytes(precise: true);
         var sw = Stopwatch.StartNew();
