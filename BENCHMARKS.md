@@ -896,6 +896,76 @@ call on the matching thread, and the op/awaiter pooling means steady-state
 zero allocation. These are the shapes a CML runtime lives in, and there is no
 dark spot in them.
 
+## Three "easy" optimizations, priced one at a time
+
+Each implemented separately with a probe benchmark run between steps, kept or
+rejected on its own numbers.
+
+### 1. The promise wake path: 160 → 40 B/op
+
+`bench/Diag --mode promise` (1M complete→wake cycles) as the probe:
+
+| step | bare action | fiber-shaped wake |
+|---|---|---|
+| baseline | 259 ns / 160 B | 259 ns / 160 B |
+| waiters are their own work items | 238 / 64 | 238 / 64 |
+| continuations stored unwrapped | 231 / 72 | **206 / 40** |
+
+Two changes. First, `Complete` used to wake each waiter with
+`Scheduler.Enqueue(w.Signal)` — a method-group conversion allocating a 64 B
+delegate per wake, plus the pooled `ActionWorkItem` behind `Enqueue(Action)`,
+whose thread-static free list starves under producer/consumer drift. Waiters
+are heap objects already, so they now implement `IThreadPoolWorkItem` (with
+ActionWorkItem's full obligations: fresh inline budget, catch-all, end-of-item
+flush) and are enqueued directly.
+
+Second, `OnCompleted(Action)` stored its continuation wrapped in an
+`ActionWaiter`. The waiter slot now holds the `Action` itself, and the wake
+path has one more save: a parked FIBER's resume delegate targets its
+state-machine box, which is a work item whose `Execute` is equivalent to
+invoking the delegate. That equivalence is asserted by the `IFiberResume`
+marker — and only that marker; any object can implement `IThreadPoolWorkItem`
+with unrelated semantics, so the target sniff must not be widened. Result: a
+fiber blocked on a promise wakes with zero allocation beyond the promise
+itself. Bare actions (ToTask, Detach — the rare shape) pay +8 B for the
+returned `ActionWorkItem`; accepted.
+
+### 2. Choose-send adapter closures: 128 → 40 B/op
+
+`ChannelSendEvent`/`ChannelSendOperation` adapted their `Action<Unit>` to
+`PublishSend`'s bare `Action` with a fresh closure per publish per branch —
+88 B/op on the choose-send row, paid even by losing branches. `PublishSend`
+now takes `Action<Unit>` and `PutOp` carries it in a typed `ResumeGive` field
+beside the direct path's `ResumePut`; the receive-side match sites dispatch by
+the discriminator they already had (choose givers have a `SyncState`, direct
+givers never do). Choose send (2): 128 → 40 B/op, ~113 → ~93 ns/op. Ring, the
+direct-path control, unchanged.
+
+### 3. GC tuning: measured, and it went the WRONG way — do not ship it
+
+The obvious remaining knob was gen0 size: this document's own pre-batching
+measurement had GC at ~9%. Post-batching, same session, medians:
+
+| | Diag spawn row (trivial work) | Spawn storm (fibers execute) |
+|---|---|---|
+| default ServerGC | 47 ns, 23 gen0, 5.9 ms pause | **103-108 ns** |
+| `DOTNET_GCgen0size=0x20000000` | **37 ns, 0 gen0, 0 pause** | 122-134 ns |
+| workstation GC | 41 ns, 9 gen0, 17 ms pause | — |
+
+The micro says +21%, the real benchmark says **−20%, consistently, across
+alternated runs**. The difference is the working set: with a 512 MB nursery
+nothing is recycled during the run, so every allocation lands on cold pages —
+page faults and TLB misses instead of the cache-hot memory that frequent,
+cheap gen0 collections recycle. The trivial-work micro is bump-allocation
+bound and never touches its allocations again, which is exactly the shape
+real fibers are not.
+
+So the recommendation for the hosted language is: ServerGC on (already the
+default here), and NO gen0 tuning. The pre-batching 9% belonged to the 80 MB
+live backlog that batching eliminated. This is the third falsified-by-harness
+hypothesis in this document; the micro that "confirms" a tuning is not the
+workload.
+
 ## Choice randomization: free, and off by default
 
 Publish order is priority: when two branches are ready at publish time, the
