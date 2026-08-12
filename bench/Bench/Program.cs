@@ -39,6 +39,13 @@ public static class Program
         for (int i = 0; i < args.Length - 1; i++)
             if (args[i] == "--reps") reps = int.Parse(args[i + 1]);
 
+        // `varied` runs the dark-spot suite (see Varied.cs) instead of the main one.
+        if (Array.IndexOf(args, "varied") >= 0)
+        {
+            await Varied.Run(reps);
+            return;
+        }
+
         Console.WriteLine($".NET {Environment.Version}, ProcessorCount={Environment.ProcessorCount}, " +
                           $"ServerGC={System.Runtime.GCSettings.IsServerGC}, reps={reps}");
         Console.WriteLine();
@@ -52,6 +59,7 @@ public static class Program
         await Repeat(reps, PingPong);
         await Repeat(reps, Ring);
         await Repeat(reps, SelectChoose);
+        await Repeat(reps, SelectChooseFiber);
         await Repeat(reps, FanOut);
 
         // SimpleChannel is the like-for-like comparison against a Go `chan`: both
@@ -328,6 +336,44 @@ public static class Program
         long alloc = GC.GetTotalAllocatedBytes(precise: true) - before;
 
         Report("Select/Choose", rounds, sw, alloc, "ops");
+    }
+
+    /// <summary>
+    /// The same select with the receiver as a native fiber awaiting the event.
+    ///
+    /// This is the row comparable to Hopac, whose receiver is a job INSIDE its
+    /// scheduler. The row above runs the receiver as a foreign async Task through
+    /// Cml.SyncAsync — the CmlValueTaskSource interop path — which pays for the
+    /// pooled IValueTaskSource, the ValueTask machinery and the Task builder's
+    /// ExecutionContext handling on every op, none of which the Hopac receiver pays.
+    /// Measured side by side (bench/Diag --mode select, same session): interop
+    /// ~125-140 ns/op and bimodal, fiber ~100 ns/op stable (after EventAwaiter
+    /// pooling), Hopac ~116 ns/op.
+    /// </summary>
+    static async Fiber SelectReceiverFiber(IEvent<int> choose, int rounds)
+    {
+        for (int i = 0; i < rounds; i++) await choose;
+    }
+
+    static async Task SelectChooseFiber()
+    {
+        const int rounds = 1_000_000;
+        var a = new Channel<int>();
+        var b = new Channel<int>();
+
+        var sender = Bjo.Spawn(() => SelectSender(a, b, rounds));
+
+        long before = GC.GetTotalAllocatedBytes(precise: true);
+        var sw = Stopwatch.StartNew();
+
+        var choose = Cml.Choose(a, b);
+        await Bjo.Spawn(() => SelectReceiverFiber(choose, rounds)).ToTask();
+
+        await sender.ToTask();
+        sw.Stop();
+        long alloc = GC.GetTotalAllocatedBytes(precise: true) - before;
+
+        Report("Select/Choose(F)", rounds, sw, alloc, "ops");
     }
 
     // ---------------------------------------------------------------------

@@ -25,22 +25,45 @@ public static class SelectHarness
         Console.WriteLine($"reps={reps}");
         Console.WriteLine();
 
-        RunOnce(200_000, out _);          // warm up JIT and the op free-lists
+        // Two receivers for the same choose:
+        //  - "Task+SyncAsync": the historical row. A foreign async Task looping
+        //    Cml.SyncAsync, i.e. the CmlValueTaskSource interop path.
+        //  - "Fiber+await": the native path, and the one actually comparable to
+        //    Hopac, whose receiver is a job INSIDE its scheduler. A fiber awaiting
+        //    the event goes through EventAwaiter: no pooled IValueTaskSource, no
+        //    ValueTask, no Task method builder, no ExecutionContext handling.
+        Measure("Task+SyncAsync", reps, RunOnce);
+        Measure("Fiber+await   ", reps, RunOnceFiber);
+
+        // The same fiber row with randomized branch order, to price the fairness
+        // knob (Cml.RandomizeChoice): one thread-static xorshift and a swap per
+        // sync.
+        Cml.RandomizeChoice = true;
+        try { Measure("Fiber+random  ", reps, RunOnceFiber); }
+        finally { Cml.RandomizeChoice = false; }
+
+        Console.WriteLine();
+        Console.WriteLine("Reference on this machine: Hopac 141 ns/op (528 B/op), Go 134 ns/op.");
+    }
+
+    delegate double OneRun(int rounds, out double bytesPerOp);
+
+    static void Measure(string name, int reps, OneRun run)
+    {
+        run(200_000, out _);              // warm up JIT and the op free-lists
 
         var samples = new double[reps];
         double alloc = 0;
         for (int r = 0; r < reps; r++)
         {
-            samples[r] = RunOnce(1_000_000, out alloc);
+            samples[r] = run(1_000_000, out alloc);
         }
 
         var sorted = (double[])samples.Clone();
         Array.Sort(sorted);
 
-        Console.WriteLine($"Select/Choose  per rep: {string.Join(" ", Array.ConvertAll(samples, s => $"{s,6:F0}"))}");
+        Console.WriteLine($"{name} per rep: {string.Join(" ", Array.ConvertAll(samples, s => $"{s,6:F0}"))}");
         Console.WriteLine($"               median : {sorted[reps / 2]:F0} ns/op   ({alloc:F0} B/op)");
-        Console.WriteLine();
-        Console.WriteLine("Reference on this machine: Hopac 141 ns/op (528 B/op), Go 134 ns/op.");
     }
 
     static double RunOnce(int rounds, out double bytesPerOp)
@@ -68,6 +91,31 @@ public static class SelectHarness
     static async Task Receive(IEvent<int> choose, int rounds)
     {
         for (int i = 0; i < rounds; i++) await Cml.SyncAsync(choose);
+    }
+
+    static double RunOnceFiber(int rounds, out double bytesPerOp)
+    {
+        var a = new Channel<int>();
+        var b = new Channel<int>();
+
+        var sender = Bjo.Spawn(() => Sender(a, b, rounds));
+        var choose = Cml.Choose(a, b);
+
+        long before = GC.GetTotalAllocatedBytes(precise: true);
+        var sw = Stopwatch.StartNew();
+
+        Bjo.Spawn(() => ReceiveFiber(choose, rounds)).ToTask().GetAwaiter().GetResult();
+        sender.ToTask().GetAwaiter().GetResult();
+
+        sw.Stop();
+        bytesPerOp = (GC.GetTotalAllocatedBytes(precise: true) - before) / (double)rounds;
+
+        return sw.Elapsed.TotalMilliseconds * 1e6 / rounds;
+    }
+
+    static async Fiber ReceiveFiber(IEvent<int> choose, int rounds)
+    {
+        for (int i = 0; i < rounds; i++) await choose;
     }
 
     static async Fiber Sender(Channel<int> a, Channel<int> b, int rounds)

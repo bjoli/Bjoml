@@ -375,7 +375,15 @@ let private mainSuite reps =
 
 [<EntryPoint>]
 let main argv =
-    if argv |> Array.contains "select" then
+    if argv |> Array.contains "varied" then
+        // Same --reps convention as the main suite.
+        let reps =
+            match Array.tryFindIndex ((=) "--reps") argv with
+            | Some i when i + 1 < argv.Length -> int argv.[i + 1]
+            | _ -> 1
+        Varied.run reps
+        0
+    elif argv |> Array.contains "select" then
         let reps = if argv.Length > 1 then int argv.[1] else 9
         printfn ".NET %O, ProcessorCount=%d, ServerGC=%b, reps=%d"
             Environment.Version Environment.ProcessorCount
