@@ -44,10 +44,22 @@ public sealed class PutOp<T> : Operation
     [ThreadStatic] private static int _freeCount;
 
     public T Value = default!;
+
+    /// <summary>Resume for a DIRECT send (awaiter path); null for choose givers.</summary>
     public Action ResumePut = null!;
+
+    /// <summary>
+    /// Resume for a send under a sync block. Typed <c>Action&lt;Unit&gt;</c> so
+    /// <c>PublishSend</c> can carry the choose's <c>onSync</c> straight through:
+    /// adapting it to a bare <c>Action</c> allocated a closure per publish per
+    /// branch (88 B of the choose-send row's 128 B/op).
+    /// </summary>
+    public Action<Unit>? ResumeGive;
+
     public PutOp<T>? Next;
 
-    public static PutOp<T> Rent(SyncState? state, int eventId, T value, Action resumePut)
+    /// <summary>Rent for a choose giver (parked by <c>PublishSend</c>).</summary>
+    public static PutOp<T> Rent(SyncState? state, int eventId, T value, Action<Unit> resumeGive)
     {
         var op = _free;
         if (op is null)
@@ -57,7 +69,7 @@ public sealed class PutOp<T> : Operation
                 State = state,
                 EventId = eventId,
                 Value = value,
-                ResumePut = resumePut
+                ResumeGive = resumeGive
             };
         }
 
@@ -67,7 +79,22 @@ public sealed class PutOp<T> : Operation
         op.State = state;
         op.EventId = eventId;
         op.Value = value;
-        op.ResumePut = resumePut;
+        op.ResumeGive = resumeGive;
+        return op;
+    }
+
+    /// <summary>Rent for a direct send; the awaiter sets <see cref="ResumePut"/> on park.</summary>
+    public static PutOp<T> RentDirect(T value)
+    {
+        var op = _free;
+        if (op is null) return new PutOp<T> { Value = value };
+
+        _free = op.Next;
+        _freeCount--;
+        op.Next = null;
+        op.State = null;
+        op.EventId = 0;
+        op.Value = value;
         return op;
     }
 
@@ -76,6 +103,7 @@ public sealed class PutOp<T> : Operation
         State = null;
         Value = default!;
         ResumePut = null!;
+        ResumeGive = null;
         EventId = 0;
 
         if (_freeCount < MaxCached)

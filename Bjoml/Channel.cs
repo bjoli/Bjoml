@@ -215,7 +215,7 @@ public class Channel<T> : IEvent<T>
         return live;
     }
 
-    public void PublishSend(SyncState state, int eventId, T value, Action resumePut)
+    public void PublishSend(SyncState state, int eventId, T value, Action<Unit> onSync)
     {
         Action<T>? getResume = null;
         Action? directTakerResume = null;
@@ -313,7 +313,7 @@ public class Channel<T> : IEvent<T>
                 if (state.IsSynchronized) return;
                 NotePark();
 
-                var myOp = PutOp<T>.Rent(state, eventId, value, resumePut);
+                var myOp = PutOp<T>.Rent(state, eventId, value, onSync);
                 if (_giversTail == null)
                 {
                     _giversHead = _giversTail = myOp;
@@ -339,12 +339,13 @@ public class Channel<T> : IEvent<T>
             Scheduler.Dispatch(directTakerResume);
         }
 
-        Scheduler.Dispatch(resumePut);
+        Scheduler.Dispatch(onSync, Unit.Value);
     }
 
     public void PublishReceive(SyncState state, int eventId, Action<T> resumeGet)
     {
-        Action? putResume = null;
+        Action? putResume = null;           // a direct giver's continuation
+        Action<Unit>? putResumeGive = null; // a choose giver's onSync
         SyncState? putState = null;
         int putEventId = 0;
         T putValue = default!;
@@ -390,7 +391,7 @@ public class Channel<T> : IEvent<T>
                             if (curr == _giversTail) _giversTail = prev;
 
                             putValue = curr.Value;
-                            putResume = curr.ResumePut;
+                            putResumeGive = curr.ResumeGive;
                             putState = curr.State;
                             putEventId = curr.EventId;
                             curr.Recycle();
@@ -457,9 +458,15 @@ public class Channel<T> : IEvent<T>
 
         // Outside lock:
         state.MarkSynchronized(eventId);
-        if (putState != null) putState.MarkSynchronized(putEventId);
-
-        Scheduler.Dispatch(putResume!);
+        if (putState != null)
+        {
+            putState.MarkSynchronized(putEventId);
+            Scheduler.Dispatch(putResumeGive!, Unit.Value);
+        }
+        else
+        {
+            Scheduler.Dispatch(putResume!);
+        }
         Scheduler.Dispatch(resumeGet, putValue);
     }
 
@@ -470,6 +477,7 @@ public class Channel<T> : IEvent<T>
     public bool TryDirectReceive(out T value)
     {
         Action? putResume = null;
+        Action<Unit>? putResumeGive = null;
         SyncState? putState = null;
         int putEventId = 0;
         value = default!;
@@ -505,7 +513,7 @@ public class Channel<T> : IEvent<T>
                         if (curr == _giversTail) _giversTail = prev;
 
                         value = curr.Value;
-                        putResume = curr.ResumePut;
+                        putResumeGive = curr.ResumeGive;
                         putState = curr.State;
                         putEventId = curr.EventId;
                         curr.Recycle();
@@ -542,9 +550,15 @@ public class Channel<T> : IEvent<T>
             }
         }
 
+        if (putState != null)
+        {
+            putState.MarkSynchronized(putEventId);
+            Scheduler.Dispatch(putResumeGive!, Unit.Value);
+            return true;
+        }
+
         if (putResume != null)
         {
-            if (putState != null) putState.MarkSynchronized(putEventId);
             Scheduler.Dispatch(putResume);
             return true;
         }
@@ -555,6 +569,7 @@ public class Channel<T> : IEvent<T>
     public void ParkDirectReceive(GetOp<T> op)
     {
         Action? putResume = null;
+        Action<Unit>? putResumeGive = null;
         SyncState? putState = null;
         int putEventId = 0;
         bool matched = false;
@@ -591,7 +606,7 @@ public class Channel<T> : IEvent<T>
                         if (curr == _giversTail) _giversTail = prev;
 
                         val = curr.Value;
-                        putResume = curr.ResumePut;
+                        putResumeGive = curr.ResumeGive;
                         putState = curr.State;
                         putEventId = curr.EventId;
                         curr.Recycle();
@@ -650,8 +665,15 @@ public class Channel<T> : IEvent<T>
             }
         }
 
-        if (putState != null) putState.MarkSynchronized(putEventId);
-        Scheduler.Dispatch(putResume!);
+        if (putState != null)
+        {
+            putState.MarkSynchronized(putEventId);
+            Scheduler.Dispatch(putResumeGive!, Unit.Value);
+        }
+        else
+        {
+            Scheduler.Dispatch(putResume!);
+        }
         Scheduler.Enqueue(op.DirectResume!);
     }
 
@@ -912,7 +934,7 @@ public readonly struct ChannelSendAwaiter<T> : ICriticalNotifyCompletion
         else
         {
             _isCompleted = false;
-            _op = PutOp<T>.Rent(null, 0, value, null!);
+            _op = PutOp<T>.RentDirect(value);
         }
     }
 
@@ -958,5 +980,5 @@ public readonly struct ChannelSendOperation<T> : IEvent<Unit>
     public ChannelSendAwaiter<T> GetAwaiter() => new(_channel, _value);
 
     public void Publish(SyncState state, int eventId, Action<Unit> onSync)
-        => _channel.PublishSend(state, eventId, _value, () => onSync(Unit.Value));
+        => _channel.PublishSend(state, eventId, _value, onSync);
 }

@@ -441,7 +441,7 @@ public class ChannelSendEvent<T> : IEvent<Unit>
 
     public void Publish(SyncState sharedState, int eventId, Action<Unit> onSync)
     {
-        _channel.PublishSend(sharedState, eventId, _value, () => onSync(new Unit()));
+        _channel.PublishSend(sharedState, eventId, _value, onSync);
     }
 }
 
