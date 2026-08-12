@@ -176,10 +176,25 @@ public static class Program
 
     static async Fiber SendOne(Channel<int> ch, int v) => await ch.Send(v);
 
+    /// <summary>
+    /// The receiver is a fiber, not an async Task. Same fairness point as the
+    /// spawn storm: Go's `main` IS a goroutine, so its receive loop runs native.
+    /// The old Task receiver paid the interop path per op — a fresh
+    /// ChannelReceiveEvent (24 B) and a SyncState (40 B) per receive — which
+    /// belongs to the interop boundary, not to spawn+rendezvous.
+    /// </summary>
+    static async Fiber ReceiveSum(Channel<int> ch, int n, long[] sink)
+    {
+        long total = 0;
+        for (int i = 0; i < n; i++) total += await ch.Receive();
+        sink[0] = total;
+    }
+
     static async Task SpawnAndSend()
     {
         const int n = 200_000;
         var ch = new Channel<int>();
+        var sink = new long[1];
 
         long before = GC.GetTotalAllocatedBytes(precise: true);
         var sw = Stopwatch.StartNew();
@@ -190,13 +205,12 @@ public static class Program
             Bjo.Spawn(static s => SendOne(s.ch, s.v), (ch, v));
         }
 
-        long total = 0;
-        for (int i = 0; i < n; i++) total += await Cml.SyncAsync(new ChannelReceiveEvent<int>(ch));
+        await Bjo.Spawn(() => ReceiveSum(ch, n, sink)).ToTask();
 
         sw.Stop();
         long alloc = GC.GetTotalAllocatedBytes(precise: true) - before;
 
-        Report("Spawn+send", n, sw, alloc, $"total={total}");
+        Report("Spawn+send", n, sw, alloc, $"total={sink[0]}");
     }
 
     // ---------------------------------------------------------------------

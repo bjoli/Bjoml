@@ -106,7 +106,7 @@ internal sealed class FiberStateMachineBox<TStateMachine> : IThreadPoolWorkItem
 // copied around; this reference is what actually persists.
 // ---------------------------------------------------------------------------
 
-public sealed class FiberCore<T> : Promise<T>, IThreadPoolWorkItem
+public class FiberCore<T> : Promise<T>, IThreadPoolWorkItem
 {
     [ThreadStatic] internal static FiberCore<T>? CurrentSpawning;
 
@@ -125,16 +125,14 @@ public sealed class FiberCore<T> : Promise<T>, IThreadPoolWorkItem
     private object? _box;
     internal Action<FiberCore<T>>? _runner;
     internal object? _spawnBody;
-    internal object? _spawnState;
     internal object? _spawnInherited;
 
     public FiberCore() { }
 
-    internal FiberCore(Action<FiberCore<T>> runner, object body, object? state, object? inherited)
+    internal FiberCore(Action<FiberCore<T>> runner, object body, object? inherited)
     {
         _runner = runner;
         _spawnBody = body;
-        _spawnState = state;
         _spawnInherited = inherited;
     }
 
@@ -192,11 +190,33 @@ public sealed class FiberCore<T> : Promise<T>, IThreadPoolWorkItem
         finally
         {
             _spawnBody = null;
-            _spawnState = null;
             CurrentSpawning = null;
             if (hasContextChange) FiberContext.Current = prev;
             Scheduler.OnWorkItemComplete();
         }
+    }
+}
+
+/// <summary>
+/// A spawned fiber that carries caller state, stored INLINE and typed.
+///
+/// The state used to live in an <c>object?</c> field on <see cref="FiberCore{T}"/>,
+/// which boxed every value-typed state — and the idiomatic state for a static
+/// spawn lambda is exactly a value tuple, so the common case paid a 32 B box per
+/// spawn (measured on the Spawn+send benchmark). A generic subclass keeps the
+/// tuple inline and lets the runner read it without a cast-unbox.
+///
+/// The runner clears the slot immediately after starting the body, so a
+/// long-lived promise handle does not pin the spawn arguments.
+/// </summary>
+internal sealed class StatefulFiberCore<TState, T> : FiberCore<T>
+{
+    internal TState SpawnState;
+
+    internal StatefulFiberCore(Action<FiberCore<T>> runner, object body, TState state, object? inherited)
+        : base(runner, body, inherited)
+    {
+        SpawnState = state;
     }
 }
 

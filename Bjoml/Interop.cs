@@ -46,18 +46,21 @@ public static class Bjo
     public static Promise<T> Spawn<T>(Func<Fiber<T>> body)
     {
         var inherited = FiberContext.Current;
-        var core = new FiberCore<T>(SpawnRunners<T>.FuncRunner, body, null, inherited);
+        var core = new FiberCore<T>(SpawnRunners<T>.FuncRunner, body, inherited);
         Scheduler.EnqueueSpawn(core);
         return core;
     }
 
     /// <summary>
-    /// Spawn a bjoroutine with state and a result. Enables zero-closure static lambdas.
+    /// Spawn a bjoroutine with state and a result. Enables zero-closure static
+    /// lambdas. The state is stored typed and inline (see
+    /// <see cref="StatefulFiberCore{TState, T}"/>), so a value-typed state — the
+    /// idiomatic tuple — is not boxed.
     /// </summary>
     public static Promise<TResult> Spawn<TState, TResult>(Func<TState, Fiber<TResult>> body, TState state)
     {
         var inherited = FiberContext.Current;
-        var core = new FiberCore<TResult>(SpawnStateRunners<TState, TResult>.StateRunner, body, state, inherited);
+        var core = new StatefulFiberCore<TState, TResult>(SpawnStateRunners<TState, TResult>.StateRunner, body, state, inherited);
         Scheduler.EnqueueSpawn(core);
         return core;
     }
@@ -66,18 +69,19 @@ public static class Bjo
     public static Promise<Unit> Spawn(Func<Fiber> body)
     {
         var inherited = FiberContext.Current;
-        var core = new FiberCore<Unit>(SpawnUnitRunners.FuncRunner, body, null, inherited);
+        var core = new FiberCore<Unit>(SpawnUnitRunners.FuncRunner, body, inherited);
         Scheduler.EnqueueSpawn(core);
         return core;
     }
 
     /// <summary>
-    /// Spawn a bjoroutine with state and no useful result. Enables zero-closure static lambdas.
+    /// Spawn a bjoroutine with state and no useful result. Enables zero-closure
+    /// static lambdas; the state is stored typed and inline, unboxed.
     /// </summary>
     public static Promise<Unit> Spawn<TState>(Func<TState, Fiber> body, TState state)
     {
         var inherited = FiberContext.Current;
-        var core = new FiberCore<Unit>(SpawnStateRunners<TState, Unit>.UnitStateRunner, body, state, inherited);
+        var core = new StatefulFiberCore<TState, Unit>(SpawnStateRunners<TState, Unit>.UnitStateRunner, body, state, inherited);
         Scheduler.EnqueueSpawn(core);
         return core;
     }
@@ -158,16 +162,20 @@ internal static class SpawnStateRunners<TState, TResult>
 {
     public static readonly Action<FiberCore<TResult>> StateRunner = static core =>
     {
+        var stateful = (StatefulFiberCore<TState, TResult>)core;
         var func = (Func<TState, Fiber<TResult>>)core._spawnBody!;
-        var state = (TState)core._spawnState!;
+        var state = stateful.SpawnState;
+        stateful.SpawnState = default!;   // the promise handle must not pin the args
         var fiber = func(state);
         if (!ReferenceEquals(fiber.Core, core)) fiber.AsPromise().Forward(core);
     };
 
     public static readonly Action<FiberCore<Unit>> UnitStateRunner = static core =>
     {
+        var stateful = (StatefulFiberCore<TState, Unit>)core;
         var func = (Func<TState, Fiber>)core._spawnBody!;
-        var state = (TState)core._spawnState!;
+        var state = stateful.SpawnState;
+        stateful.SpawnState = default!;
         var fiber = func(state);
         if (!ReferenceEquals(fiber.Core, core)) fiber.AsPromise().Forward(core);
     };

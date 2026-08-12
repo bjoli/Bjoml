@@ -663,8 +663,25 @@ time despite the 672:0 allocation ratio.
 ## What is left on the table
 
 - **~30 ns of BjoML overhead per spawn** (216 vs 185 raw pool, pre-batching).
-  `FiberCore<T>` is 80 B and carries four fields (`_runner`, `_spawnBody`,
-  `_spawnState`, `_spawnInherited`) that are dead the moment the fiber starts.
+  ~~`FiberCore<T>` is 80 B and carries four fields (`_runner`, `_spawnBody`,
+  `_spawnState`, `_spawnInherited`) that are dead the moment the fiber starts.~~
+  Partially addressed: `_spawnState` is gone — stateful spawns store their
+  state TYPED AND INLINE in `StatefulFiberCore<TState, T>`, which also removed
+  the 32 B box that every value-tuple state paid (the idiomatic shape for a
+  static spawn lambda). Spawn storm: 89 → 81 B/op; Spawn+send: −56 B/op
+  together with the receiver fix below. The three remaining dead fields
+  (24 B) would need a pooled spawn-request object, ~150 lines; by the timer
+  wheel's precedent (rejected at 144 B/op for the same complexity), that
+  fails the bar. The Spawn+send row also now uses a FIBER receiver — the old
+  async-Task receiver paid a fresh `ChannelReceiveEvent` + `SyncState` per
+  receive (64 B/op of interop cost booked against a spawn benchmark), and
+  Go's `main` is a goroutine, so the fiber receiver is the like-for-like
+  shape. Row total: 377 → 289 B/op, at allocation parity with Hopac
+  (264-304). What remains is the floor for "a suspended fiber blocked on a
+  channel with a joinable handle": the state-machine box and its MoveNext
+  delegate (~144 B, the price of the async protocol), the promise handle
+  (~80 B), and the parked PutOp (~48 B) — the same role Go fills with a 2 KB
+  goroutine stack plus a sudog.
 - **Ping-pong and Ring** are handoff-latency bound, not spawn bound. Batching does
   nothing for them; they are already within 1.1–1.3x of Go.
 - ~~**Select/Choose at 1.5x** is the widest remaining gap and is a `SyncState`
