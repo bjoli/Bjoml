@@ -782,13 +782,74 @@ medians:
 
 So after the fix: allocation is at parity with Hopac (464 vs 448), the 10x
 cliff is now a 6.6x cliff against BjoML's own fast mode, and the armed path is
-still 3.8x Hopac and 2x Go on wall time. What remains is squarely the
+still 3.8x Hopac and 2x Go on wall time. What remains was ATTRIBUTED to the
 `System.Threading.Timer` round trip through the partitioned global timer
-queue; closing it means a timer wheel, which the refactor has reduced to a
-one-function swap inside `TimeoutNode.Arm` instead of a redesign of
-`Cml.Timeout`. Whether it is worth building depends on whether the hosted
-language runs timeout-guarded selects above ~1M ops/sec — at 922 ns/op the
-armed path already sustains a million per second per core.
+queue. That attribution was a hypothesis, and building the timer wheel to test
+it is what falsified it — see the next section.
+
+### The timer wheel: built, measured, and rejected — the enqueued nack was the cost
+
+A hashed timer wheel (`TimerWheel.cs`: 256 slots x 8 ms, CAS slot stacks,
+absolute due-slots so a lagging ticker fires late-but-correct, a self-stopping
+ticker using the SpawnBatch watchdog fence pattern, and cancellation as pure
+gate-close with lazy drop) was built to eliminate the TimerQueue crossing.
+It changed nothing:
+
+| armed micro (arm+lose+cancel) | ns/op | B/op |
+|---|---|---|
+| `System.Threading.Timer` | 666 | 384 |
+| timer wheel | 638 | 240 |
+
+A wash on time. So the ~650 ns was never the timer mechanism — it was
+something COMMON to both paths, and the remaining suspect was the nack
+delivery: `MarkSynchronized` enqueued every nack as a pool work item, and a
+cross-thread pool item costs ~185 ns before it wakes anyone (see the
+queue-cost table above), plus the wake, plus the cache traffic of running the
+cancel on a different core than the arm.
+
+Nack actions are already REQUIRED to never run user code (the FiberContext
+limitation note), and the built-in ones close a gate or `TrySetResult` a nack
+promise. So `MarkSynchronized` now fires them inline on the committing thread,
+wrapped in a try/catch so a throwing nack cannot unwind into a channel
+matching loop. That one change, with 52 tests passing:
+
+| armed end-to-end choose(timeout, recv) | ns/op | B/op |
+|---|---|---|
+| combinator spec, enqueued nacks (the original) | 1170 | 1360 |
+| `TimeoutEvent` + enqueued nacks (Timer) | 791 | 480 |
+| `TimeoutEvent` + INLINE nacks, Timer | **317** | 448 |
+| `TimeoutEvent` + INLINE nacks, wheel | 402 | 304 |
+| Hopac (same session) | 257 | 448 |
+| Go | 475 | — |
+
+Two verdicts, both from measurement:
+
+- **The inline nack is the fix.** One guarded call replaces a pool hop per
+  losing withNack branch, and the armed timeout path lands at 317 ns/op —
+  1.2x from Hopac's timer wheel, comfortably ahead of Go, and 3.7x better
+  than where this section started. It also speeds up every OTHER nack user
+  (the combinator spec dropped 1170 → 970 without being touched).
+- **The wheel is not worth its code, and was deleted.** With the real cost
+  removed, the wheel measured ~400 ns/op with 2-3x the run-to-run variance of
+  the plain Timer (its shared ticker batches fires into 8 ms pulses), and its
+  one reliable win was the 144 B Timer object. Against ~150 lines of fenced
+  stop/re-arm handshake, CAS slot stacks and catch-up logic, that is a bad
+  trade, so it is not in the tree — this section is its record. For a future
+  re-measurement, the shape that was tested: 256 slots x 8 ms; nodes carry an
+  ABSOLUTE due slot so a lagging ticker fires late-but-correct with catch-up
+  capped at one revolution; arm is one CAS push onto a lock-free slot stack;
+  cancel is the gate-close the node already does, with the drain dropping
+  closed nodes when it next passes their slot (so cancelled nodes are held at
+  most ~2 s, not until deadline); one self-stopping ticker Timer for the
+  whole process, using the SpawnBatch watchdog's fenced stop/re-arm
+  handshake. It slots in behind `TimeoutNode.Arm` without touching anything
+  else.
+
+The methodological note worth keeping: the wheel was worth BUILDING precisely
+because it isolated the timer mechanism as a variable. It answered "is it the
+timer?" with a clean no, which is what pointed at the enqueue. This is the
+same lesson as the MarkSynchronized-lock and NextEventId experiments earlier
+in this document — attribution by deletion beats attribution by reading.
 
 ### Dark spot 3, accepted: many-to-many convoys on the channel Monitor
 

@@ -166,7 +166,26 @@ public class SyncState
 
         while (toFireHead != null)
         {
-            Scheduler.Enqueue(toFireHead.Action);
+            // Fired INLINE, not enqueued. A nack action is required to never run
+            // user code (see FiberContext's limitation note) — the built-in ones
+            // close a timeout node's gate or TrySetResult a nack promise — so the
+            // committing thread can run it directly and skip a pool work item,
+            // which costs several times what the action does (a cross-thread pool
+            // item is ~185 ns before it wakes anyone; see the queue-cost table in
+            // BENCHMARKS.md).
+            //
+            // This enqueue — not the timer mechanism — was the dominant cost of
+            // the armed choose+timeout path: firing inline took it from 791 to
+            // 317 ns/op. That was established by building a timer wheel to
+            // replace System.Threading.Timer and measuring no difference; the
+            // wheel was then discarded. See "The timer wheel: built, measured,
+            // and rejected" in BENCHMARKS.md.
+            //
+            // The try/catch is load-bearing: this runs inside the rendezvous
+            // commit path, and a throwing nack must not unwind into a channel
+            // matching loop.
+            try { toFireHead.Action(); }
+            catch (Exception ex) { Scheduler.ReportUnhandled(ex); }
             toFireHead = toFireHead.Next;
         }
     }
