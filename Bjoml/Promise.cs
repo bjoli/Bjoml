@@ -78,6 +78,43 @@ internal interface IPromiseWaiter
 }
 
 /// <summary>
+/// Base for the concrete waiters: a waiter IS its own thread-pool work item.
+///
+/// <c>Complete</c> used to wake a waiter with <c>Scheduler.Enqueue(w.Signal)</c>,
+/// and that method-group conversion allocated a fresh 64 B Action per wake — plus
+/// the pooled ActionWorkItem behind Enqueue(Action), whose thread-static free
+/// list starves under producer/consumer thread drift. Enqueuing the waiter object
+/// itself costs nothing: it is already on the heap.
+///
+/// <see cref="Execute"/> carries the same obligations as ActionWorkItem's: a
+/// fresh inline budget, a catch-all (an unhandled exception on a pool thread
+/// kills the process), and the end-of-work-item flush that keeps batched spawns
+/// from being stranded.
+/// </summary>
+internal abstract class PromiseWaiter : IPromiseWaiter, IThreadPoolWorkItem
+{
+    public abstract void Signal();
+    public abstract bool IsAbandoned { get; }
+
+    public void Execute()
+    {
+        Scheduler.InlineDepth = 0;
+        try
+        {
+            Signal();
+        }
+        catch (Exception ex)
+        {
+            Scheduler.ReportUnhandled(ex);
+        }
+        finally
+        {
+            Scheduler.OnWorkItemComplete();
+        }
+    }
+}
+
+/// <summary>
 /// A write-once cell that is also a PERSISTENT CML event.
 ///
 /// This is the handle type for <c>spawn</c> and the bridge type for C# tasks.
@@ -113,17 +150,19 @@ public class Promise<T> : IEvent<Result<T>>
 
         if (oldWaiters != null)
         {
-            if (oldWaiters is IPromiseWaiter single)
+            // The waiter itself is the work item; see PromiseWaiter. No delegate,
+            // no ActionWorkItem, no allocation on the wake path.
+            if (oldWaiters is PromiseWaiter single)
             {
-                if (!single.IsAbandoned) Scheduler.Enqueue(single.Signal);
+                if (!single.IsAbandoned) Scheduler.Enqueue(single);
             }
-            else if (oldWaiters is List<IPromiseWaiter> list)
+            else if (oldWaiters is List<PromiseWaiter> list)
             {
                 lock (list)
                 {
                     foreach (var w in list)
                     {
-                        if (!w.IsAbandoned) Scheduler.Enqueue(w.Signal);
+                        if (!w.IsAbandoned) Scheduler.Enqueue(w);
                     }
                 }
             }
@@ -134,7 +173,7 @@ public class Promise<T> : IEvent<Result<T>>
 
     // ---- waiter registration ----------------------------------------------
 
-    internal void Register(IPromiseWaiter waiter)
+    internal void Register(PromiseWaiter waiter)
     {
         SpinWait spin = default;
         while (true)
@@ -151,13 +190,13 @@ public class Promise<T> : IEvent<Result<T>>
                 if (Interlocked.CompareExchange(ref _waiters, waiter, null) == null)
                     return;
             }
-            else if (current is IPromiseWaiter single)
+            else if (current is PromiseWaiter single)
             {
-                var list = new List<IPromiseWaiter>(4) { single, waiter };
+                var list = new List<PromiseWaiter>(4) { single, waiter };
                 if (Interlocked.CompareExchange(ref _waiters, list, single) == single)
                     return;
             }
-            else if (current is List<IPromiseWaiter> list)
+            else if (current is List<PromiseWaiter> list)
             {
                 lock (list)
                 {
@@ -182,15 +221,15 @@ public class Promise<T> : IEvent<Result<T>>
     /// <summary>Run <paramref name="k"/> now if already complete, else on completion.</summary>
     internal void OnCompleted(Action k) => Register(new ActionWaiter(k));
 
-    private sealed class ActionWaiter : IPromiseWaiter
+    private sealed class ActionWaiter : PromiseWaiter
     {
         private readonly Action _k;
         public ActionWaiter(Action k) => _k = k;
-        public void Signal() => _k();
+        public override void Signal() => _k();
 
         // A fiber awaiting a promise directly is never abandoned; it has nothing
         // else it could be doing.
-        public bool IsAbandoned => false;
+        public override bool IsAbandoned => false;
     }
 
     internal Result<T> Outcome
@@ -225,7 +264,7 @@ public class Promise<T> : IEvent<Result<T>>
         Register(new ForwardWaiter(this, target));
     }
 
-    private sealed class ForwardWaiter : IPromiseWaiter
+    private sealed class ForwardWaiter : PromiseWaiter
     {
         private readonly Promise<T> _source;
         private readonly Promise<T> _target;
@@ -236,14 +275,14 @@ public class Promise<T> : IEvent<Result<T>>
             _target = target;
         }
 
-        public void Signal()
+        public override void Signal()
         {
             var r = _source.Outcome;
             if (r.IsError) _target.TrySetException(r.Error!);
             else _target.TrySetResult(r.Value);
         }
 
-        public bool IsAbandoned => _target.IsCompleted;
+        public override bool IsAbandoned => _target.IsCompleted;
     }
 
     /// <summary>
@@ -301,7 +340,7 @@ public class Promise<T> : IEvent<Result<T>>
         Scheduler.Dispatch(onSync, Outcome);
     }
 
-    private sealed class Waiter : IPromiseWaiter
+    private sealed class Waiter : PromiseWaiter
     {
         private readonly Promise<T> _owner;
         private readonly SyncState _state;
@@ -316,10 +355,10 @@ public class Promise<T> : IEvent<Result<T>>
             _onSync = onSync;
         }
 
-        public void Signal() => _owner.Deliver(_state, _eventId, _onSync);
+        public override void Signal() => _owner.Deliver(_state, _eventId, _onSync);
 
         /// <summary>Our sync block was won by another branch; we can be dropped.</summary>
-        public bool IsAbandoned => _state.IsSynchronized;
+        public override bool IsAbandoned => _state.IsSynchronized;
     }
 
     // ---- direct-await surface (cheaper than routing through Cml.Sync) ------
