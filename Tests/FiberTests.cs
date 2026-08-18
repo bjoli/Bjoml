@@ -33,6 +33,7 @@ public static class FiberTests
         Run("TryCommit spins past a transient claim (B4)", TryCommitSpinsPastClaim);
         Run("a promise completed on a foreign thread wakes a choose", ForeignThreadCompletion);
         Run("losing choose branches do not accumulate waiters", WaitersArePruned);
+        Run("the first completion wins the value, not the last", FirstCompletionWins);
 
         Section("Task interop");
         Run("FromTask bridges a completed task", FromTaskCompleted);
@@ -439,6 +440,30 @@ public static class FiberTests
         // sync blocks alive. Completing it must not take a noticeable amount of time
         // or fire anything.
         neverCompletes.TrySetResult(0);
+    }
+
+    /// <summary>
+    /// A write-once cell has to be write-once in the value as well as in the
+    /// answer. The first version stored before it claimed, so the loser's
+    /// <c>TrySetResult</c> returned false — correctly — and had already
+    /// overwritten the winner's value on the way to finding that out.
+    ///
+    /// Unobservable while every payload was a <c>Unit</c>. A cancellation token
+    /// carries a reason, and "cancelling twice is a no-op" has to mean the first
+    /// reason is the one kept.
+    /// </summary>
+    private static void FirstCompletionWins()
+    {
+        var p = new Promise<int>();
+
+        Assert(p.TrySetResult(1), "the first completion should win");
+        Assert(!p.TrySetResult(2), "the second completion should lose");
+        AssertEqual(1, p.GetAwaiter().GetResult(), "the loser overwrote the winner's value");
+
+        // And the same for a failure arriving second: it must not displace the
+        // value either, nor make a settled promise start throwing.
+        Assert(!p.TrySetException(new InvalidOperationException("late")), "a late failure should lose");
+        AssertEqual(1, p.GetAwaiter().GetResult(), "a late failure displaced the value");
     }
 
     // -----------------------------------------------------------------------

@@ -209,14 +209,6 @@ public static class TaskInterop
         return p;
     }
 
-    public static Promise<Unit> FromTask(Task task) => FromTask(Wrap(task));
-
-    private static async Task<Unit> Wrap(Task t)
-    {
-        await t.ConfigureAwait(false);
-        return default;
-    }
-
     private static void Settle<T>(Task<T> t, Promise<T> p)
     {
         if (t.IsCanceled) p.TrySetException(new TaskCanceledException(t));
@@ -228,6 +220,11 @@ public static class TaskInterop
     // Promise -> Task, for calling back into C#
     // -----------------------------------------------------------------------
 
+    // No call sites yet. This is the .NET-calls-Bjolang direction; deleting it
+    // closes that door and it is not obvious how to reopen it. The moment a
+    // .NET API wants an async delegate written in Bjolang — an ASP.NET
+    // `Func<HttpContext, Task>`, a `DelegatingHandler` — this is what code
+    // generation emits at the boundary.
     public static Task<T> ToTask<T>(this Promise<T> p)
     {
         var tcs = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);

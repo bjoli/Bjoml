@@ -25,14 +25,15 @@ public static class SelectHarness
         Console.WriteLine($"reps={reps}");
         Console.WriteLine();
 
-        // Two receivers for the same choose:
-        //  - "Task+SyncAsync": the historical row. A foreign async Task looping
-        //    Cml.SyncAsync, i.e. the CmlValueTaskSource interop path.
-        //  - "Fiber+await": the native path, and the one actually comparable to
-        //    Hopac, whose receiver is a job INSIDE its scheduler. A fiber awaiting
-        //    the event goes through EventAwaiter: no pooled IValueTaskSource, no
-        //    ValueTask, no Task method builder, no ExecutionContext handling.
-        Measure("Task+SyncAsync", reps, RunOnce);
+        // "Fiber+await" is the native path, and the one actually comparable to
+        // Hopac, whose receiver is a job INSIDE its scheduler. A fiber awaiting
+        // the event goes through EventAwaiter: no ValueTask, no Task method
+        // builder, no ExecutionContext handling.
+        //
+        // There used to be a "Task+SyncAsync" row here measuring a foreign async
+        // Task looping Cml.SyncAsync. That surface is gone: Bjoml is a compiler
+        // backend rather than a CML library for plain C#, and the path it
+        // measured no longer exists to be measured.
         Measure("Fiber+await   ", reps, RunOnceFiber);
 
         // The same fiber row with randomized branch order, to price the fairness
@@ -66,7 +67,7 @@ public static class SelectHarness
         Console.WriteLine($"               median : {sorted[reps / 2]:F0} ns/op   ({alloc:F0} B/op)");
     }
 
-    static double RunOnce(int rounds, out double bytesPerOp)
+    static double RunOnceFiber(int rounds, out double bytesPerOp)
     {
         var a = new Channel<int>();
         var b = new Channel<int>();
@@ -74,31 +75,6 @@ public static class SelectHarness
         var sender = Bjo.Spawn(() => Sender(a, b, rounds));
 
         // Hoisted, exactly as in bench/Bench and in the Hopac version.
-        var choose = Cml.Choose(a, b);
-
-        long before = GC.GetTotalAllocatedBytes(precise: true);
-        var sw = Stopwatch.StartNew();
-
-        Receive(choose, rounds).GetAwaiter().GetResult();
-        sender.ToTask().GetAwaiter().GetResult();
-
-        sw.Stop();
-        bytesPerOp = (GC.GetTotalAllocatedBytes(precise: true) - before) / (double)rounds;
-
-        return sw.Elapsed.TotalMilliseconds * 1e6 / rounds;
-    }
-
-    static async Task Receive(IEvent<int> choose, int rounds)
-    {
-        for (int i = 0; i < rounds; i++) await Cml.SyncAsync(choose);
-    }
-
-    static double RunOnceFiber(int rounds, out double bytesPerOp)
-    {
-        var a = new Channel<int>();
-        var b = new Channel<int>();
-
-        var sender = Bjo.Spawn(() => Sender(a, b, rounds));
         var choose = Cml.Choose(a, b);
 
         long before = GC.GetTotalAllocatedBytes(precise: true);

@@ -31,8 +31,6 @@ class Program
 
         Console.WriteLine("Starting Bjoml CML Stress Tests...\n");
 
-        await RunRingBenchmark();
-        Console.WriteLine();
         await RunSimpleRingBenchmark();
         Console.WriteLine();
         await RunProducerConsumerBenchmark();
@@ -50,69 +48,12 @@ class Program
         Console.WriteLine("\nAll tests completed.");
     }
 
-    static async Task RunRingBenchmark()
-    {
-        const int numWorkers = 1000;
-        const int numTrips = 1000;
-
-        Console.WriteLine($"--- Ring Benchmark: {numWorkers} workers, {numTrips} trips around the ring ---");
-        
-        var channels = new Channel<int>[numWorkers];
-        for (int i = 0; i < numWorkers; i++)
-        {
-            channels[i] = new Channel<int>();
-        }
-
-        var tasks = new Task[numWorkers];
-
-        // Create the workers
-        for (int i = 0; i < numWorkers; i++)
-        {
-            int workerId = i;
-            var inChannel = channels[workerId];
-            var outChannel = channels[(workerId + 1) % numWorkers];
-
-            tasks[i] = Task.Run(async () =>
-            {
-                while (true)
-                {
-                    int msg = await inChannel.GetMessage();
-                    if (msg == -1) // Poison pill
-                    {
-                        if (workerId != numWorkers - 1) 
-                        {
-                            await outChannel.PutMessage(-1);
-                        }
-                        break;
-                    }
-                    
-                    if (workerId == numWorkers - 1)
-                    {
-                        // Completed a trip
-                        msg++;
-                        if (msg >= numTrips)
-                        {
-                            // Reached the limit, send poison pill
-                            await outChannel.PutMessage(-1);
-                            continue;
-                        }
-                    }
-
-                    await outChannel.PutMessage(msg);
-                }
-            });
-        }
-
-        var sw = Stopwatch.StartNew();
-        
-        // Inject the first message at worker 0
-        await channels[0].PutMessage(0);
-
-        await Task.WhenAll(tasks);
-
-        sw.Stop();
-        Console.WriteLine($"Ring Benchmark finished in {sw.ElapsedMilliseconds} ms. Passed {numWorkers * numTrips} messages.");
-    }
+    /// <summary>
+    /// One message into a channel, as a fiber. A `Channel&lt;T&gt;` rendezvous is a
+    /// suspension, so injecting the ring's first message needs something that can
+    /// suspend — which since the ValueTask facade went is a fiber and nothing else.
+    /// </summary>
+    static async Fiber SendOne(Channel<int> channel, int value) => await channel.Send(value);
 
     static async Task RunProducerConsumerBenchmark()
     {
@@ -124,51 +65,45 @@ class Program
 
         var sharedChannel = new Channel<int>();
 
-        var producers = new Task[numProducers];
-        var consumers = new Task[numConsumers];
-        
-        int totalReceived = 0;
+        var producers = new Promise<Unit>[numProducers];
+        var consumers = new Promise<Unit>[numConsumers];
 
         var sw = Stopwatch.StartNew();
 
-        // Start Consumers
         for (int i = 0; i < numConsumers; i++)
-        {
-            consumers[i] = Task.Run(async () =>
-            {
-                while (true)
-                {
-                    int msg = await sharedChannel.GetMessage();
-                    if (msg == -1) break;
-                    System.Threading.Interlocked.Increment(ref totalReceived);
-                }
-            });
-        }
+            consumers[i] = Bjo.Spawn(() => Consume(sharedChannel));
 
-        // Start Producers
         for (int i = 0; i < numProducers; i++)
-        {
-            producers[i] = Task.Run(async () =>
-            {
-                for (int j = 0; j < messagesPerProducer; j++)
-                {
-                    await sharedChannel.PutMessage(j);
-                }
-            });
-        }
+            producers[i] = Bjo.Spawn(() => Produce(sharedChannel, messagesPerProducer));
 
-        await Task.WhenAll(producers);
+        foreach (var p in producers) await p.ToTask();
 
-        // Send poison pills
+        // Poison pills, one per consumer. Each is a rendezvous, so by the time
+        // the last one returns every consumer has taken one and is on its way out.
         for (int i = 0; i < numConsumers; i++)
-        {
-            await sharedChannel.PutMessage(-1);
-        }
+            await Bjo.Spawn(() => SendOne(sharedChannel, -1)).ToTask();
 
-        await Task.WhenAll(consumers);
+        foreach (var c in consumers) await c.ToTask();
 
         sw.Stop();
-        Console.WriteLine($"Producer/Consumer finished in {sw.ElapsedMilliseconds} ms. Total Messages Processed: {totalReceived}");
+        Console.WriteLine($"Producer/Consumer finished in {sw.ElapsedMilliseconds} ms. Total Messages Processed: {_totalReceived}");
+    }
+
+    private static int _totalReceived;
+
+    static async Fiber Consume(Channel<int> channel)
+    {
+        while (true)
+        {
+            int msg = await channel.Receive();
+            if (msg == -1) return;
+            System.Threading.Interlocked.Increment(ref _totalReceived);
+        }
+    }
+
+    static async Fiber Produce(Channel<int> channel, int count)
+    {
+        for (int j = 0; j < count; j++) await channel.Send(j);
     }
 
     static async Task RunSimpleRingBenchmark()
@@ -309,7 +244,7 @@ class Program
 
         var sw = Stopwatch.StartNew();
 
-        await Cml.SyncAsyncVoid(new ChannelSendEvent<int>(channels[0], 0));
+        await Bjo.Spawn(() => SendOne(channels[0], 0)).ToTask();
 
         foreach (var h in handles) await h.ToTask();
 
@@ -487,12 +422,11 @@ class Program
 
         var ev1 = Cml.WithNack(nackChan => 
         {
-            // Background task to listen for the NACK
-            Task.Run(async () => 
-            {
-                await Cml.SyncAsync(nackChan);
-                nackFired = true;
-            });
+            // A bare callback rather than a fiber waiting on the nack: a fiber
+            // would park forever in every run where this branch WON, since the
+            // nack promise never completes there. Setting a flag runs no user
+            // code, so it is safe on the borrowed thread that delivers it.
+            Cml.Sync(nackChan, _ => nackFired = true);
 
             return Cml.Wrap(new ChannelReceiveEvent<string>(chan1), s => s.ToUpper() + " (from chan1)");
         });
@@ -502,10 +436,10 @@ class Program
         var choice = Cml.Choose(ev1, ev2);
 
         // Send to chan2 to ensure ev2 wins
-        var sendTask = chan2.PutMessage("hello");
-        
-        var result = await Cml.SyncAsync(choice);
-        await sendTask;
+        var sender = Bjo.Spawn(() => SendString(chan2, "hello"));
+
+        var result = await Bjo.Spawn<string>(() => SyncOne(choice)).ToTask();
+        await sender.ToTask();
 
         Console.WriteLine($"Result: {result}");
         
@@ -513,4 +447,10 @@ class Program
         await Task.Delay(100);
         Console.WriteLine($"Nack fired for chan1? {nackFired}");
     }
+
+    static async Fiber SendString(Channel<string> channel, string value) => await channel.Send(value);
+
+    /// Syncing is a suspension, so the one place a plain `async Task` used to
+    /// reach into CML is now a one-shot fiber.
+    static async Fiber<string> SyncOne(IEvent<string> ev) => await ev;
 }

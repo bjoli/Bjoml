@@ -47,39 +47,42 @@ public static class MyServer
         // Local variables hoisted to struct fields
         private object _msg; 
         
-        // Awaiter fields
-        private ValueTaskAwaiter<object> _u1;
-        private ValueTaskAwaiter _u2;
+        // Awaiter fields. These are the awaiters a direct `await ch.Receive()` /
+        // `await ch.Send(v)` resolves to: the channel's own, which park an
+        // operation without going through `Cml.Sync` at all. This is the path the
+        // compiled language takes.
+        private ChannelReceiveAwaiter<object> _u1;
+        private ChannelSendAwaiter<object> _u2;
 
         public void MoveNext()
         {
             int num = _state;
             try
             {
-                ValueTaskAwaiter<object> getAwaiter;
-                ValueTaskAwaiter putAwaiter;
+                ChannelReceiveAwaiter<object> getAwaiter;
+                ChannelSendAwaiter<object> putAwaiter;
                 
                 while (true) // The original while(true) loop
                 {
                     switch (num)
                     {
-                        case 0: // Resuming from GetMessage
+                        case 0: // Resuming from Receive
                             getAwaiter = _u1;
                             _u1 = default;
                             num = (_state = -1);
-                            goto Label_GetMessage_Completed;
+                            goto Label_Receive_Completed;
 
-                        case 1: // Resuming from PutMessage (ping)
-                        case 2: // Resuming from PutMessage (sup)
-                        case 3: // Resuming from PutMessage (wat)
+                        case 1: // Resuming from Send (ping)
+                        case 2: // Resuming from Send (sup)
+                        case 3: // Resuming from Send (wat)
                             putAwaiter = _u2;
                             _u2 = default;
                             num = (_state = -1);
-                            goto Label_PutMessage_Completed;
+                            goto Label_Send_Completed;
                     }
 
                     // --- INITIAL EXECUTION / LOOP RESTART ---
-                    getAwaiter = @in.GetMessage().GetAwaiter();
+                    getAwaiter = @in.Receive().GetAwaiter();
                     if (!getAwaiter.IsCompleted)
                     {
                         num = (_state = 0);
@@ -89,14 +92,14 @@ public static class MyServer
                         return; // Yield thread
                     }
 
-                Label_GetMessage_Completed:
+                Label_Receive_Completed:
                     _msg = getAwaiter.GetResult();
                     Console.WriteLine($"server-received: {_msg}");
 
                     // --- BRANCHING LOGIC ---
                     if (_msg is "ping!")
                     {
-                        putAwaiter = @out.PutMessage("pong!").GetAwaiter();
+                        putAwaiter = @out.Send("pong!").GetAwaiter();
                         if (!putAwaiter.IsCompleted)
                         {
                             num = (_state = 1);
@@ -108,7 +111,7 @@ public static class MyServer
                     }
                     else if (_msg is "sup")
                     {
-                        putAwaiter = @out.PutMessage("not-much-u").GetAwaiter();
+                        putAwaiter = @out.Send("not-much-u").GetAwaiter();
                         if (!putAwaiter.IsCompleted)
                         {
                             num = (_state = 2);
@@ -120,7 +123,7 @@ public static class MyServer
                     }
                     else
                     {
-                        putAwaiter = @out.PutMessage($"wat {_msg}").GetAwaiter();
+                        putAwaiter = @out.Send($"wat {_msg}").GetAwaiter();
                         if (!putAwaiter.IsCompleted)
                         {
                             num = (_state = 3);
@@ -131,7 +134,7 @@ public static class MyServer
                         }
                     }
 
-                Label_PutMessage_Completed:
+                Label_Send_Completed:
                     putAwaiter.GetResult(); // Throw if faulted
                     
                     // The switch ends, the while(true) loop restarts, pulling the next message.

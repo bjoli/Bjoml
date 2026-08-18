@@ -45,30 +45,33 @@ public static class MyClient
         private object[] _messages;
         private int _index;
 
-        private ValueTaskAwaiter _u1;
-        private ValueTaskAwaiter<object> _u2;
+        // The awaiters a direct `await ch.Send(v)` / `await ch.Receive()` resolves
+        // to: the channel's own, which park an operation without going through
+        // `Cml.Sync` at all. This is the path the compiled language takes.
+        private ChannelSendAwaiter<object> _u1;
+        private ChannelReceiveAwaiter<object> _u2;
 
         public void MoveNext()
         {
             int num = _state;
             try
             {
-                ValueTaskAwaiter putAwaiter;
-                ValueTaskAwaiter<object> getAwaiter;
+                ChannelSendAwaiter<object> putAwaiter;
+                ChannelReceiveAwaiter<object> getAwaiter;
 
                 if (num == 0)
                 {
                     putAwaiter = _u1;
                     _u1 = default;
                     num = (_state = -1);
-                    goto Label_PutMessage_Completed;
+                    goto Label_Send_Completed;
                 }
                 if (num == 1)
                 {
                     getAwaiter = _u2;
                     _u2 = default;
                     num = (_state = -1);
-                    goto Label_GetMessage_Completed;
+                    goto Label_Receive_Completed;
                 }
 
                 // Initial setup
@@ -79,7 +82,7 @@ public static class MyClient
                 if (_index >= _messages.Length) goto Label_Loop_End;
 
                 var msg = _messages[_index];
-                putAwaiter = @out.PutMessage(msg).GetAwaiter();
+                putAwaiter = @out.Send(msg).GetAwaiter();
                 if (!putAwaiter.IsCompleted)
                 {
                     num = (_state = 0);
@@ -89,10 +92,10 @@ public static class MyClient
                     return; // Yield thread
                 }
 
-            Label_PutMessage_Completed:
+            Label_Send_Completed:
                 putAwaiter.GetResult();
 
-                getAwaiter = @in.GetMessage().GetAwaiter();
+                getAwaiter = @in.Receive().GetAwaiter();
                 if (!getAwaiter.IsCompleted)
                 {
                     num = (_state = 1);
@@ -102,7 +105,7 @@ public static class MyClient
                     return; // Yield thread
                 }
 
-            Label_GetMessage_Completed:
+            Label_Receive_Completed:
                 var response = getAwaiter.GetResult();
                 Console.WriteLine($"client-received: {response}");
 

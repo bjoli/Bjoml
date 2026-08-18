@@ -8,6 +8,14 @@ dotnet run -c Release --project StressTest
 
 Machine: AMD Ryzen 9 5900X (12C/24T), .NET 10.0.104, Linux 6.18 (Fedora 43).
 
+> **A note on the `Task`+`SyncAsync` rows below.** They measure the plain-C#
+> `ValueTask` façade — `Cml.SyncAsync` over a pooled `CmlValueTaskSource` — which
+> has since been deleted; see `docs/design.md` §"Scope". The numbers are kept
+> because they are what motivated the `Fiber`+`await` path and they price the
+> interop boundary that a future reintroduction would have to pay again. They are
+> not reproducible against the current tree: the harness rows that produced them
+> are gone with the surface.
+
 ---
 
 ## Baseline — before the IThreadPoolWorkItem / Fiber migration

@@ -39,20 +39,6 @@ public static class Cml
         ev.Publish(state, SyncState.RootEventId, continuation);
     }
 
-    public static ValueTask<T> SyncAsync<T>(IEvent<T> ev)
-    {
-        var source = CmlValueTaskSource<T>.Rent();
-        Sync(ev, source.OnSyncDelegate);
-        return new ValueTask<T>(source, source.Version);
-    }
-
-    public static ValueTask SyncAsyncVoid(IEvent<Unit> ev)
-    {
-        var source = CmlValueTaskSource<Unit>.Rent();
-        Sync(ev, source.OnSyncDelegate);
-        return new ValueTask(source, source.Version);
-    }
-
     /// <summary>
     /// When true, <c>choose</c> publishes its branches in a random rotation
     /// instead of left-to-right. Default false.

@@ -132,6 +132,16 @@ public class Promise<T> : IEvent<Result<T>>
     private T _value = default!;
     private ExceptionDispatchInfo? _error;
 
+    /// <summary>
+    /// Claimed by the writer that won, before it stores anything.
+    ///
+    /// A separate flag rather than <see cref="_waiters"/> reaching the sentinel,
+    /// because those are two different moments: the cell has an owner from the
+    /// claim, and is readable only from the publish. A loser must be turned away
+    /// at the first of them.
+    /// </summary>
+    private int _claimed;
+
     public bool IsCompleted => ReferenceEquals(Volatile.Read(ref _waiters), s_completedSentinel);
 
     public bool TrySetResult(T value) => Complete(value, null);
@@ -142,11 +152,21 @@ public class Promise<T> : IEvent<Result<T>>
 
     private bool Complete(T value, ExceptionDispatchInfo? error)
     {
+        // CLAIM BEFORE STORING. This used to store first and find out afterwards
+        // whether it had won, which returned the right answer and wrote the
+        // wrong value: a second, losing completion still overwrote the winner's.
+        // Invisible while every payload was a Unit, and a bug the moment one
+        // carries information — a cancellation token holds a CancelReason, and
+        // "first reason wins" is exactly the property that was not true.
+        if (Interlocked.Exchange(ref _claimed, 1) != 0) return false;
+
         _value = value;
         _error = error;
 
+        // Publishes the two stores above: the exchange is a full fence, and
+        // every reader tests IsCompleted — an acquiring read of this same field
+        // — before it touches Outcome.
         var oldWaiters = Interlocked.Exchange(ref _waiters, s_completedSentinel);
-        if (ReferenceEquals(oldWaiters, s_completedSentinel)) return false;
 
         if (oldWaiters != null)
         {

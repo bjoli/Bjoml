@@ -4,6 +4,28 @@ BjoML is a Concurrent ML implementation for a Scheme-like language that compiles
 C#. This document describes the runtime after the `IThreadPoolWorkItem` + `Fiber`
 migration, and records what is deliberately *not* done yet.
 
+## Scope: a compiler backend, not a CML library for C#
+
+There used to be a second surface here — `Cml.SyncAsync`/`SyncAsyncVoid`,
+`Channel<T>.GetMessage`/`PutMessage`, and the pooled `CmlValueTaskSource` behind
+them — letting a plain `async Task` sync on an event. It is gone.
+
+Everything the language emits goes through `Fiber` and awaits an `IEvent<T>`
+directly, so that façade had no callers outside the benchmarks measuring it, and
+its own doc comment recorded a leak it could not fix: a `ValueTask` created and
+never awaited is never recycled. Deleting it also drops the
+`Microsoft.Extensions.ObjectPool` package — its only user — and with it the
+`CopyLocalLockFileAssemblies` workaround that existed to get that DLL next to the
+probing path of a compiled program.
+
+What remains of the interop surface is deliberate and small: `TaskInterop.FromTask`
+(a `Task` coming in), `TaskInterop.Cancellable` (the withdrawable form the language
+emits for `task->event`), and `TaskInterop.ToTask` — which has no callers, and is
+kept because it is the only path for **.NET calling into Bjolang**.
+
+This is reversible, but it means rewriting the pooled completion source if the
+decision changes.
+
 ---
 
 ## 1. Scheduling
@@ -40,7 +62,6 @@ Nothing in the runtime captures or restores an `ExecutionContext`:
 | scheduler enqueue | `UnsafeQueueUserWorkItem` |
 | fiber suspension | builder calls `awaiter.UnsafeOnCompleted` |
 | `Task` bridging | `ConfigureAwait(false)` + `UnsafeOnCompleted`, never `ContinueWith` |
-| `ValueTask` interop | `CmlValueTaskSource` strips `FlowExecutionContext` |
 
 This is what makes it safe to enqueue work unsafely everywhere. The hosted language
 carries its own dynamic environment (below), so flowing EC would cost an allocation
@@ -163,10 +184,18 @@ the corresponding fix is reverted.
   zero, by a park counter on the channel, at no measurable cost. See below.
 - **B8** — `MarkSynchronized` was a public method that would stomp another thread's
   claim. Precondition now documented; self-committing events go through `TryCommit`.
-- **B9** — the `ValueTask` path flowed `ExecutionContext`. Flag now stripped.
+- **B9** — the `ValueTask` path flowed `ExecutionContext`. Flag stripped at the
+  time; the path itself has since been deleted along with the rest of the
+  plain-C# façade.
 - **B10** — root event id is now `0` and reserved; dead `Operation` helpers removed;
   operation pools are per-`T` statics rather than per-`Channel` instances;
   `withNack` no longer allocates a `Channel<Unit>` per publish.
+- **B11** — `Promise.Complete` stored its value *before* claiming the cell, so a
+  second, losing `TrySetResult` returned `false` — correctly — having already
+  overwritten the winner's value on the way to finding out. Unobservable while
+  every payload was a `Unit`. The hosted language's cancellation token carries a
+  reason, and "cancelling twice is a no-op" has to mean the first reason is the
+  one kept, so the claim now precedes the store.
 
 Two bugs in the *proposed* code were also fixed: `TaskInterop.Cancellable` could not
 compile (generic inference through an async lambda) and leaked its
@@ -245,13 +274,6 @@ replacement tests read `RawPendingReceiveCount`, which does not clean.
 A contended operation is re-queued at the **tail**, so FIFO is not preserved and a
 sender can be starved under sustained contention. Worth stating in the language
 manual so the runtime is not held to FIFO later.
-
-### `ValueTask` discard leak
-
-`CmlValueTaskSource` is returned to its pool by `GetResult`. A `ValueTask` that is
-created and never awaited is never recycled. In the language, `(put! ch v)` in
-statement position looks exactly like a discard, so the compiler must always await
-it — or better, use the event/awaiter path, which has no pooled source at all.
 
 ### Blocking bridge
 
