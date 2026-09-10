@@ -294,7 +294,25 @@ public struct FiberMethodBuilder<T>
         // No ExecutionContext capture or restore. The body runs on the caller's
         // thread with the caller's dynamic environment already installed, which is
         // exactly what a direct procedure call should look like.
-        stateMachine.MoveNext();
+        //
+        // The caller's context is put back when this returns, because a call that
+        // *suspends* returns here with the callee's environment still installed:
+        // the body ran up to its first await on this thread, and anything it
+        // pushed on the way — a (parameterize ...), a cancellation scope — is
+        // still in the slot. The caller would then adopt it, and take its
+        // snapshot from it at its own next suspension.
+        //
+        // The callee loses nothing: its box captured this same environment inside
+        // MoveNext, at the await, which is what reinstates it when it resumes.
+        var caller = FiberContext.Current;
+        try
+        {
+            stateMachine.MoveNext();
+        }
+        finally
+        {
+            FiberContext.Current = caller;
+        }
     }
 
     public void SetStateMachine(IAsyncStateMachine stateMachine) { /* legacy/debugger only */ }
@@ -332,9 +350,21 @@ public struct FiberMethodBuilder
 
     public Fiber Task => new Fiber(_core);
 
+    /// <summary>See <see cref="FiberMethodBuilder{T}.Start"/>: the caller's dynamic
+    /// environment is put back when a suspended call returns here.</summary>
     public void Start<TStateMachine>(ref TStateMachine stateMachine)
         where TStateMachine : IAsyncStateMachine
-        => stateMachine.MoveNext();
+    {
+        var caller = FiberContext.Current;
+        try
+        {
+            stateMachine.MoveNext();
+        }
+        finally
+        {
+            FiberContext.Current = caller;
+        }
+    }
 
     public void SetStateMachine(IAsyncStateMachine stateMachine) { }
 

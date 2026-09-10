@@ -142,6 +142,9 @@ public class Promise<T> : IEvent<Result<T>>
     /// </summary>
     private int _claimed;
 
+    /// <summary>EXPERIMENT: amortised prune threshold, guarded by lock(list).</summary>
+    private int _pruneAt = 8;
+
     public bool IsCompleted => ReferenceEquals(Volatile.Read(ref _waiters), s_completedSentinel);
 
     public bool TrySetResult(T value) => Complete(value, null);
@@ -260,8 +263,11 @@ public class Promise<T> : IEvent<Result<T>>
                         return;
                     }
 
-                    if (list.Count >= 8)
+                    if (list.Count >= _pruneAt)
+                    {
                         list.RemoveAll(static w => w is PromiseWaiter pw && pw.IsAbandoned);
+                        _pruneAt = Math.Max(8, list.Count * 2);
+                    }
 
                     list.Add(waiter);
                     return;
